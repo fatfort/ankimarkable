@@ -1,0 +1,43 @@
+[package]
+name = "ankimarkable"
+version = "0.1.0"
+edition = "2021"
+description = "Anki review client for the reMarkable Paper Pro (AppLoad/QTFB app)"
+
+# Spike bins (Phase 0/1 GO/NO-GO gates) live in src/bin/; the eventual app lands
+# in src/main.rs (Phase 2+). Mirrors the fastterm crate layout.
+
+[dependencies]
+# Anki's real backend (rslib). Pinned to a stable tag. The AnkiWeb sync client
+# lives inside this crate. rustls (not native OpenSSL) so it cross-compiles to
+# musl cleanly.
+anki = { git = "https://github.com/ankitects/anki", tag = "25.09.4", default-features = false, features = ["rustls"] }
+
+# Pure-Rust CPU HTML/CSS rendering stack (blitz + stylo + taffy + parley +
+# vello_cpu). No wgpu/GPU — cross-compiles to musl, runs on the device's A53.
+# We drive blitz directly (not hyper-render's high-level API) so we can inject a
+# FontContext with embedded fonts — the device has no usable font discovery for a
+# static-musl binary, and embedding gives deterministic card rendering anyway.
+blitz-dom = "0.2"
+blitz-html = "0.2"
+blitz-paint = "0.2"
+blitz-traits = "0.2"
+parley = "0.6"
+anyrender = "0.6"
+anyrender_vello_cpu = "0.7"
+png = "0.17"
+
+# Sync transport: anki's async sync client takes a reqwest::Client; we drive it on
+# a small tokio runtime. rustls features come via anki's `rustls` feature (unified).
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+anyhow = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+# unwind (not abort) — matches fastterm; lets us swallow panics gracefully if we
+# later embed in any FFI context. Plain AppLoad bin doesn't strictly need it.
+panic = "unwind"
