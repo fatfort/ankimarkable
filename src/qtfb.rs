@@ -8,6 +8,7 @@
 //! Anki uses the native portrait panel (1620×2160), so the rotation machinery
 //! from fastterm is dropped here. Card pixels are composited via `blit_rgba`.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io;
@@ -28,9 +29,11 @@ pub const FBFMT_RMPP_RGB888: u8 = 1;
 pub const UPDATE_ALL: i32 = 0;
 pub const UPDATE_PARTIAL: i32 = 1;
 
-// refresh / waveform modes
-pub const REFRESH_MODE_FAST: i32 = 1; // DU — quick button feedback
-pub const REFRESH_MODE_CONTENT: i32 = 3; // GC16 — clean full grayscale, card render
+// refresh / waveform modes (rm-appload maps 0..4 → Mono/DU/A2/GC16/GL16)
+pub const REFRESH_MODE_UFAST: i32 = 0; // Mono — fastest, coarsest (native pen path)
+pub const REFRESH_MODE_FAST: i32 = 1; // DU (binary B/W) — noticeably laggy for ink
+pub const REFRESH_MODE_ANIMATE: i32 = 2; // A2 — fastterm's "buttery" typing path; ink hot path
+pub const REFRESH_MODE_CONTENT: i32 = 3; // GC16 — clean full grayscale/colour, settle only
 
 // input event types (server → client, MESSAGE_USERINPUT)
 pub const INPUT_TOUCH_PRESS: i32 = 0x10;
@@ -117,6 +120,10 @@ pub struct Qtfb {
     pub shm: &'static mut [u8],
     pub width: usize,
     pub height: usize,
+    // Last refresh mode sent. The rm-appload server does an expensive wait on every
+    // MESSAGE_SET_REFRESH_MODE, so we only send it on an actual change — a continuous
+    // stroke then stays in A2 with zero mode messages.
+    current_mode: Cell<i32>,
 }
 
 impl Qtfb {
@@ -231,6 +238,7 @@ impl Qtfb {
             shm,
             width: RMPP_WIDTH,
             height: RMPP_HEIGHT,
+            current_mode: Cell::new(-1),
         })
     }
 
@@ -283,12 +291,16 @@ impl Qtfb {
     }
 
     fn send(&self, msg: &ClientMessage) -> io::Result<()> {
+        self.send_flags(msg, 0)
+    }
+
+    fn send_flags(&self, msg: &ClientMessage, flags: i32) -> io::Result<()> {
         let rc = unsafe {
             libc::send(
                 self.fd,
                 msg as *const _ as *const libc::c_void,
                 mem::size_of::<ClientMessage>(),
-                0,
+                flags,
             )
         };
         if rc == -1 {
@@ -298,10 +310,58 @@ impl Qtfb {
     }
 
     pub fn set_refresh_mode(&self, mode: i32) -> io::Result<()> {
+        if self.current_mode.get() == mode {
+            return Ok(());
+        }
         self.send(&ClientMessage {
             msg_type: MESSAGE_SET_REFRESH_MODE,
             contents: ClientMessageContents { refresh_mode: mode },
-        })
+        })?;
+        self.current_mode.set(mode);
+        Ok(())
+    }
+
+    /// Non-blocking refresh-mode set — used on the inking hot path so a busy e-ink
+    /// server never blocks the poll loop (dropping the message is harmless; the mode
+    /// is sticky and will be re-sent).
+    pub fn try_set_refresh_mode(&self, mode: i32) -> io::Result<()> {
+        if self.current_mode.get() == mode {
+            return Ok(());
+        }
+        let r = self.send_flags(
+            &ClientMessage {
+                msg_type: MESSAGE_SET_REFRESH_MODE,
+                contents: ClientMessageContents { refresh_mode: mode },
+            },
+            libc::MSG_DONTWAIT,
+        );
+        if r.is_ok() {
+            self.current_mode.set(mode);
+        }
+        r
+    }
+
+    /// Non-blocking partial update — the inking hot path. If the server's socket
+    /// buffer is full (it's behind on e-ink refreshes), this returns `WouldBlock`
+    /// instead of stalling; the caller keeps the dirty region and retries, which
+    /// naturally rate-limits ink refreshes to what the panel can absorb. Blocking
+    /// sends here were the cause of the mid-writing "hang".
+    pub fn try_update_partial(&self, x: i32, y: i32, w: i32, h: i32) -> io::Result<()> {
+        self.send_flags(
+            &ClientMessage {
+                msg_type: MESSAGE_UPDATE,
+                contents: ClientMessageContents {
+                    update: UpdateRegionMessageContents {
+                        msg_type: UPDATE_PARTIAL,
+                        x,
+                        y,
+                        w,
+                        h,
+                    },
+                },
+            },
+            libc::MSG_DONTWAIT,
+        )
     }
 
     pub fn update_full(&self) -> io::Result<()> {
@@ -339,6 +399,54 @@ impl Qtfb {
             msg_type: MESSAGE_REQUEST_FULL_REFRESH,
             contents: ClientMessageContents { refresh_mode: 0 },
         })
+    }
+
+    /// Non-blocking recv of one server message. `Ok(Some(event))` for an input
+    /// event, `Ok(None)` when there is no pending message or it isn't an input
+    /// event, `Err` only on a real socket close. Used by the poll-multiplexed loop
+    /// (QTFB touch socket + pen evdev fd) so a quiet socket never blocks the pen.
+    pub fn recv_input_nonblock(&self) -> io::Result<Option<InputEvent>> {
+        let mut msg = ServerMessage {
+            msg_type: 0,
+            contents: ServerMessageContents {
+                init: InitMessageResponseContents {
+                    shm_key_defined: 0,
+                    shm_size: 0,
+                },
+            },
+        };
+        let got = unsafe {
+            libc::recv(
+                self.fd,
+                &mut msg as *mut _ as *mut libc::c_void,
+                mem::size_of::<ServerMessage>(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if got < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(c) if c == libc::EAGAIN || c == libc::EWOULDBLOCK => Ok(None),
+                _ => Err(e),
+            };
+        }
+        if got == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "qtfb socket closed",
+            ));
+        }
+        if msg.msg_type != MESSAGE_USERINPUT {
+            return Ok(None);
+        }
+        let ui = unsafe { msg.contents.user_input };
+        Ok(Some(InputEvent {
+            input_type: ui.input_type,
+            dev_id: ui.dev_id,
+            x: ui.x,
+            y: ui.y,
+            d: ui.d,
+        }))
     }
 
     /// Blocking recv of one server message. `Some(event)` for input, `None` for a
