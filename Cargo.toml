@@ -34,6 +34,30 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 anyhow = "1"
 libc = "0.2"
 
+# Read `revlog` directly for the home-screen streak (rslib keeps `storage`
+# private). Pinned to the version anki already resolves so the bundled sqlite
+# linkage dedupes to a single copy.
+rusqlite = { version = "0.36", features = ["bundled"] }
+
+# Math rendering (all pure-Rust, cross-compiles to aarch64-musl):
+#  - Anki's [latex]/[$]/[$$] → pre-rendered latex-<sha1>.svg → rasterize with resvg.
+#  - MathJax \(...\) / \[...\] → ReX (s3bk fork) → pathfinder Scene → self-contained
+#    <path> SVG → resvg. The fork (vendor/rex) fixes the `font` crate features
+#    (math,cff,opentype; NOT woff) and pins the servo/pdf-rs git revs.
+rex = { path = "vendor/rex" }
+# NOTE: pathfinder/font are left UNPINNED (matching the vendored ReX fork) so all
+# references resolve to ONE git source — pinning only some refs made Cargo see two
+# copies of pathfinder_content (a `?rev=` source vs a `#commit` source) and the
+# types stopped matching. Cargo.lock pins the exact commits; keep it committed.
+font = { git = "https://github.com/pdf-rs/font", features = ["math", "cff", "opentype"] }
+pathfinder_geometry = { git = "https://github.com/servo/pathfinder/" }
+pathfinder_renderer = { git = "https://github.com/servo/pathfinder/" }
+pathfinder_export = { git = "https://github.com/servo/pathfinder/" }
+resvg = "0.47"
+usvg = "0.47"
+tiny-skia = "0.12"
+regex = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

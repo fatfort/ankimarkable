@@ -40,8 +40,32 @@ fn save_png(path: &str, rgba: &[u8], w: usize, h: usize) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let col = std::env::var("ANKIMARKABLE_COL")
         .unwrap_or_else(|_| "/home/root/.ankimarkable/collection.anki2".to_string());
+    // Read stats BEFORE opening (anki takes an exclusive lock on open).
+    let stats = ankimarkable::backend::read_stats(&col);
     let mut be = Backend::open(&col)?;
+
+    // Opt-in headless AnkiWeb sync (ANKIMARKABLE_SYNC=1): mirrors main::do_sync so
+    // the full creds→sync→uni-arrival→scope chain can be verified over SSH without a
+    // live icon tap. Reads /home/root/.ankimarkable/ankiweb.txt (line1 user, line2 pass).
+    if std::env::var("ANKIMARKABLE_SYNC").as_deref() == Ok("1") {
+        let creds = std::fs::read_to_string("/home/root/.ankimarkable/ankiweb.txt")?;
+        let mut l = creds.lines();
+        if let (Some(u), Some(p)) = (l.next(), l.next()) {
+            match be.sync(u.trim(), p.trim()) {
+                Ok(s) => println!("sync: {s}"),
+                Err(e) => println!("sync FAILED: {e:#}  ||  debug: {e:?}"),
+            }
+        } else {
+            println!("sync: ankiweb.txt missing user/pass lines");
+        }
+    }
+
+    // Match the app: scope to the ANKIMARKABLE_DECK deck (default "uni") if present.
+    let deck = std::env::var("ANKIMARKABLE_DECK").unwrap_or_else(|_| "uni".to_string());
+    let scoped = be.set_deck_scope(&deck).unwrap_or(false);
+    println!("deck scope '{deck}': {}", if scoped { "applied" } else { "not found" });
     let counts = be.counts()?;
+    println!("counts after scope: new={} learning={} review={}", counts.new, counts.learning, counts.review);
     println!(
         "counts new={} learning={} review={}",
         counts.new, counts.learning, counts.review
@@ -82,11 +106,30 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Home screen (collapsible deck tree, rendered fully expanded from row 0).
+    {
+        let decks = be.deck_infos()?;
+        println!("home: {} decks, streak={} today={}", decks.len(), stats.streak, stats.reviewed_today);
+        let home = ui::compose_home(&r, &decks, 0, stats);
+        save_png("/home/root/screen_home.png", &home, ui::WIDTH, ui::HEIGHT)?;
+    }
+
+    // Optional: render a specific card (e.g. a "Pretty with Note" card) to check the
+    // bigger sizing + the revealed Note. Set ANKIMARKABLE_CID=<card id>.
+    if let Ok(cids) = std::env::var("ANKIMARKABLE_CID") {
+        if let Ok(cid) = cids.parse::<i64>() {
+            let (_q, a) = be.card_html(cid)?;
+            let buf = r.render_rgba(&a, ui::WIDTH as u32, ui::CARD_H as u32);
+            save_png("/home/root/screen_note.png", &buf, ui::WIDTH, ui::CARD_H)?;
+            println!("rendered card {cid} answer → screen_note.png");
+        }
+    }
+
     match be.next_card()? {
         Some(card) => {
-            let q = ui::compose_review(&r, &card, Phase::Question, counts, "ready");
+            let q = ui::compose_review(&r, &card, Phase::Question, counts, "ready", false);
             save_png("/home/root/screen_q.png", &q, ui::WIDTH, ui::HEIGHT)?;
-            let a = ui::compose_review(&r, &card, Phase::Answer, counts, "ready");
+            let a = ui::compose_review(&r, &card, Phase::Answer, counts, "ready", false);
             save_png("/home/root/screen_a.png", &a, ui::WIDTH, ui::HEIGHT)?;
             println!("buttons: {:?}", card.button_labels);
         }

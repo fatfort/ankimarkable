@@ -8,14 +8,17 @@
 
 use anki::card::CardId;
 use anki::collection::{Collection, CollectionBuilder};
+use anki::decks::DeckId;
 use anki::scheduler::answering::{CardAnswer, Rating};
 use anki::scheduler::states::SchedulingStates;
 use anki::sync::collection::normal::SyncActionRequired;
 use anki::sync::login::sync_login;
 use anki::sync::media::progress::MediaSyncProgress;
 use anki::template::RenderedNode;
-use anki::timestamp::TimestampMillis;
+use anki::timestamp::{TimestampMillis, TimestampSecs};
 use anyhow::Result;
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The four Anki grades, in button order.
 #[derive(Clone, Copy, Debug)]
@@ -34,6 +37,28 @@ pub struct Counts {
     pub review: usize,
 }
 
+/// A deck row for the home screen's collapsible tree. `name` is the leaf component
+/// (indent by `level`); counts include subdecks (Anki's deck-list numbers).
+/// `collapsed` starts from Anki's stored state and is then toggled at runtime.
+#[derive(Clone, Debug)]
+pub struct DeckInfo {
+    pub id: DeckId,
+    pub name: String,
+    pub level: u32,
+    pub has_children: bool,
+    pub collapsed: bool,
+    pub new: u32,
+    pub learn: u32,
+    pub review: u32,
+}
+
+/// Review stats for the home screen.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub streak: u32,
+    pub reviewed_today: u32,
+}
+
 /// A card ready to review: full self-contained HTML for each side plus the
 /// per-grade interval previews ("<1m", "1d", …). `states` is retained so the
 /// chosen grade maps to the exact next CardState the scheduler computed.
@@ -47,7 +72,13 @@ pub struct ReviewCard {
 }
 
 pub struct Backend {
-    pub col: Collection,
+    // `Option` so `sync` can take the collection by value for a full download
+    // (which consumes + replaces the DB) and then re-open it. Always `Some`
+    // outside that brief window.
+    col: Option<Collection>,
+    col_path: String,
+    // Turns `[latex]`/`[$]` SVGs + MathJax `\(...\)` in card HTML into `<img>` PNGs.
+    math: crate::mathrender::MathRenderer,
 }
 
 impl Backend {
@@ -57,12 +88,104 @@ impl Backend {
         let col = CollectionBuilder::new(col_path)
             .with_desktop_media_paths()
             .build()?;
-        Ok(Self { col })
+        let media_dir = std::path::Path::new(col_path).with_extension("media");
+        Ok(Self {
+            col: Some(col),
+            col_path: col_path.to_string(),
+            math: crate::mathrender::MathRenderer::new(media_dir),
+        })
     }
+
+    /// The open collection. In normal flow it is always present; `sync` restores
+    /// it before returning even on the full-download path.
+    fn col(&mut self) -> &mut Collection {
+        self.col.as_mut().expect("collection is open")
+    }
+
+    /// Re-open the collection from disk (after a full download replaced the file).
+    fn reopen(&mut self) -> Result<()> {
+        self.col = Some(
+            CollectionBuilder::new(&self.col_path)
+                .with_desktop_media_paths()
+                .build()?,
+        );
+        Ok(())
+    }
+
+    /// Scope all reviewing to a single deck (and, automatically, its subdecks) by
+    /// human name — e.g. `"uni"` or `"uni::algorithms"`. rslib builds the queue and
+    /// due counts from the *current* deck, so setting it here filters everything
+    /// downstream (`counts`, `next_card`) with no further changes. Non-destructive:
+    /// other decks stay in the collection, just never surfaced.
+    ///
+    /// Returns `Ok(true)` if the deck exists and was selected, `Ok(false)` if no
+    /// such deck is present yet (e.g. before the first AnkiWeb sync creates it) —
+    /// the caller can surface a "sync to fetch it" hint and keep running.
+    pub fn set_deck_scope(&mut self, human_name: &str) -> Result<bool> {
+        match self.col().get_deck_id(human_name)? {
+            Some(did) => {
+                self.col().set_current_deck(did)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Scope reviewing to a specific deck id (from the home-screen deck list).
+    pub fn set_deck_scope_id(&mut self, did: DeckId) -> Result<()> {
+        self.col().set_current_deck(did)?;
+        Ok(())
+    }
+
+    /// The full deck tree flattened depth-first for the home screen: each deck with
+    /// its `level`, `has_children`, Anki `collapsed` state, and due counts. Top-level
+    /// decks are `uni`-first then alphabetical; each subtree stays contiguous and its
+    /// children are sorted alphabetically. Empty `Default` at the top is dropped.
+    pub fn deck_infos(&mut self) -> Result<Vec<DeckInfo>> {
+        let tree = self.col().deck_tree(Some(TimestampSecs::now()))?;
+        let mut top: Vec<_> = tree.children.iter().collect();
+        top.sort_by(|a, b| {
+            (a.name != "uni", a.name.to_lowercase())
+                .cmp(&(b.name != "uni", b.name.to_lowercase()))
+        });
+        // Pre-order DFS via a stack (node ref + level). Push siblings reversed so
+        // pop() yields them in order; keeps each subtree contiguous. The proto node
+        // type stays inferred (`_`) — no need to name `anki_proto`.
+        let mut out = Vec::new();
+        let mut stack = Vec::new();
+        for node in top.into_iter().rev() {
+            if node.name == "Default"
+                && node.new_count + node.learn_count + node.review_count == 0
+                && node.children.is_empty()
+            {
+                continue;
+            }
+            stack.push((node, 0u32));
+        }
+        while let Some((node, level)) = stack.pop() {
+            out.push(DeckInfo {
+                id: DeckId(node.deck_id),
+                name: node.name.clone(),
+                level,
+                has_children: !node.children.is_empty(),
+                collapsed: node.collapsed,
+                new: node.new_count,
+                learn: node.learn_count,
+                review: node.review_count,
+            });
+            let mut kids: Vec<_> = node.children.iter().collect();
+            kids.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            for kid in kids.into_iter().rev() {
+                stack.push((kid, level + 1));
+            }
+        }
+        Ok(out)
+    }
+
 
     pub fn counts(&mut self) -> Result<Counts> {
         // fetch_limit 0 → no cards materialised, but counts still come from the queue.
-        let q = self.col.get_queued_cards(0, false)?;
+        let q = self.col().get_queued_cards(0, false)?;
         Ok(Counts {
             new: q.new_count,
             learning: q.learning_count,
@@ -73,17 +196,19 @@ impl Backend {
     /// The next due card, rendered to full card HTML, or None when the queue is
     /// exhausted (congrats screen).
     pub fn next_card(&mut self) -> Result<Option<ReviewCard>> {
-        let queued = self.col.get_queued_cards(1, false)?;
+        let queued = self.col().get_queued_cards(1, false)?;
         let Some(qc) = queued.cards.into_iter().next() else {
             return Ok(None);
         };
         let cid = qc.card.id();
 
-        let out = self.col.render_existing_card(cid, false, false)?;
-        let question = wrap_card(&out.css, &nodes_to_html(&out.qnodes));
-        let answer = wrap_card(&out.css, &nodes_to_html(&out.anodes));
+        let out = self.col().render_existing_card(cid, false, false)?;
+        let q_html = self.math.preprocess(&nodes_to_html(&out.qnodes));
+        let a_html = self.math.preprocess(&nodes_to_html(&out.anodes));
+        let question = wrap_card(&out.css, &q_html);
+        let answer = wrap_card(&out.css, &a_html);
 
-        let labels = self.col.describe_next_states(&qc.states)?;
+        let labels = self.col().describe_next_states(&qc.states)?;
         let button_labels = [
             labels.first().cloned().unwrap_or_default(),
             labels.get(1).cloned().unwrap_or_default(),
@@ -98,6 +223,15 @@ impl Backend {
             button_labels,
             states: qc.states,
         }))
+    }
+
+    /// Render a specific card's (question, answer) HTML by card id — used by the
+    /// headless screen test to render a chosen notetype (e.g. "Pretty with Note").
+    pub fn card_html(&mut self, cid: i64) -> Result<(String, String)> {
+        let out = self.col().render_existing_card(CardId(cid), false, false)?;
+        let q = self.math.preprocess(&nodes_to_html(&out.qnodes));
+        let a = self.math.preprocess(&nodes_to_html(&out.anodes));
+        Ok((wrap_card(&out.css, &q), wrap_card(&out.css, &a)))
     }
 
     /// Grade a card — writes the new scheduling state to the collection DB.
@@ -118,36 +252,66 @@ impl Backend {
             custom_data: None,
             from_queue: true,
         };
-        self.col.answer_card(&mut answer)?;
+        self.col().answer_card(&mut answer)?;
         Ok(())
     }
 
-    /// Sync with AnkiWeb (login → normal sync). Returns a short status string.
-    /// A full sync requirement is surfaced (not auto-resolved) — that's rare and
-    /// destructive enough to warrant an explicit user choice later.
+    /// Sync with AnkiWeb: login → collection sync → media sync.
+    ///
+    /// If AnkiWeb requires a full sync, we auto-resolve by **downloading** — this is
+    /// a review-only client whose on-device collection is disposable, so pulling
+    /// AnkiWeb's authoritative copy is always the right (and safe) resolution. We
+    /// never auto-*upload* (that could clobber AnkiWeb), so an upload-only full sync
+    /// is surfaced for the user to resolve on desktop. This is what lets a stale or
+    /// freshly-provisioned device fetch the `uni` deck on first sync.
     pub fn sync(&mut self, username: &str, password: &str) -> Result<String> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        rt.block_on(async {
-            // Matches anki's default web client.
-            let client = reqwest::Client::builder().http1_only().build()?;
-            let auth = sync_login(username, password, None, client.clone()).await?;
-            let out = self.col.normal_sync(auth.clone(), client.clone()).await?;
+        // Matches anki's default web client.
+        let client = reqwest::Client::builder().http1_only().build()?;
+        let auth = rt.block_on(sync_login(username, password, None, client.clone()))?;
 
-            // Media files (card images/audio) sync separately from the collection DB.
-            let mgr = self.col.media()?;
-            let progress = self.col.new_progress_handler::<MediaSyncProgress>();
-            mgr.sync_media(progress, auth, client, None).await?;
-
-            Ok(match out.required {
-                SyncActionRequired::NoChanges => "up to date".to_string(),
-                SyncActionRequired::NormalSyncRequired => "synced".to_string(),
-                SyncActionRequired::FullSyncRequired { .. } => {
-                    "full sync required (resolve on desktop)".to_string()
+        // 1) Collection sync.
+        let out = rt.block_on(self.col().normal_sync(auth.clone(), client.clone()))?;
+        let status = match out.required {
+            SyncActionRequired::NoChanges => "up to date",
+            SyncActionRequired::NormalSyncRequired => "synced",
+            SyncActionRequired::FullSyncRequired { download_ok, .. } => {
+                if download_ok {
+                    // AnkiWeb shards accounts across hosts; `normal_sync` follows the
+                    // redirect for its own requests and reports the sharded endpoint in
+                    // `new_endpoint`. A fresh `full_download` builds a new client from
+                    // `auth`, so we must point it at that endpoint or it hits the wrong
+                    // host and fails with SyncError.
+                    let mut dl_auth = auth.clone();
+                    if let Some(ep) = out.new_endpoint.as_deref() {
+                        if let Ok(url) = reqwest::Url::parse(ep) {
+                            dl_auth.endpoint = Some(url);
+                        }
+                    }
+                    // Consume the collection for the full download (it closes the DB
+                    // and replaces the file wholesale). Always re-open afterwards —
+                    // even on failure the handle is closed, so we must restore
+                    // `self.col` before propagating any error (else later `col()`
+                    // calls panic).
+                    let col = self.col.take().expect("collection is open");
+                    let res = rt.block_on(col.full_download(dl_auth, client.clone()));
+                    self.reopen()?;
+                    res?;
+                    "downloaded"
+                } else {
+                    return Ok("full sync needs upload — resolve on desktop".to_string());
                 }
-            })
-        })
+            }
+        };
+
+        // 2) Media (card images/audio) — synced after the collection is settled.
+        let mgr = self.col().media()?;
+        let progress = self.col().new_progress_handler::<MediaSyncProgress>();
+        rt.block_on(mgr.sync_media(progress, auth, client, None))?;
+
+        Ok(status.to_string())
     }
 }
 
@@ -167,12 +331,90 @@ fn nodes_to_html(nodes: &[RenderedNode]) -> String {
 
 /// Wrap a card side in the same shell Anki's webview uses: the notetype CSS in a
 /// `<style>` block, body class `card`, content in `#qa`.
+///
+/// Typography: the content is nested in an `.am-pad` frame we own so a deck's own
+/// CSS (which targets `.card`/`.front`/`.back`, almost never `.am-pad`) can't
+/// override the page margins. Generous side padding, a capped measure centred in
+/// the panel, and a comfortable line-height give the card room to breathe instead
+/// of hugging the bezel. Our reset runs BEFORE the notetype CSS so decks can still
+/// restyle their own content.
 fn wrap_card(css: &str, body: &str) -> String {
-    // White background + black text baseline BEFORE the notetype CSS (which may
-    // override) — matches Anki's webview default and keeps blitz output opaque.
+    // Two style blocks: a baseline BEFORE the notetype CSS (so decks can restyle
+    // their own content), and an override block AFTER it (so it wins). The override
+    // (a) enlarges cards — many decks here use "anki-prettify", which caps itself at
+    // `--card-max-width: 40em` / 16px, rendering a small column on the 1620px panel;
+    // we lift the width cap and bump the fonts so cards fill the screen — and
+    // (b) reveals the prettify "Note"/"Example" panes, which are `display:none` and
+    // JS-toggled (blitz runs no JS), so they'd never show otherwise.
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
-         html,body{{background:#fff;color:#000;margin:0;}}{css}</style></head>\
-         <body class=\"card\"><div id=\"qa\">{body}</div></body></html>"
+         html,body{{background:#fff;color:#000;margin:0;padding:0;}}\
+         body.card{{font-size:40px;line-height:1.5;}}\
+         .am-pad{{box-sizing:border-box;padding:64px 88px;max-width:1500px;\
+         margin:0 auto;}}\
+         .am-pad img{{max-width:100%;height:auto;}}\
+         .am-pad hr{{border:none;border-top:2px solid #d0d0d0;margin:40px 0;}}\
+         {css}\
+         /* am-overrides — win over the notetype CSS */\
+         :root{{--font-size-regular:30px!important;--font-size-small:24px!important;\
+         --card-max-width:60em!important;--img-width:66%!important;}}\
+         body.card{{font-size:36px!important;line-height:1.5!important;}}\
+         .prettify-flashcard{{max-width:none!important;}}\
+         .am-pad{{max-width:1520px!important;}}\
+         #note-content,#example-content{{display:block!important;}}\
+         #note-button,#example-button{{display:none!important;}}\
+         </style></head>\
+         <body class=\"card\"><div class=\"am-pad\"><div id=\"qa\">{body}</div></div></body></html>"
     )
+}
+
+/// Read the review streak + reviews-done-today from `revlog`.
+///
+/// MUST be called BEFORE the collection is opened by rslib: anki sets
+/// `PRAGMA locking_mode=exclusive`, so once it holds the file no other connection
+/// can read it. The caller computes this once at startup (nothing holds the lock
+/// yet), caches it, and increments `reviewed_today` per in-session grade. Day index
+/// is `floor((review_secs - crt)/86400)`; streak = consecutive days ending today or
+/// (grace) yesterday. Best-effort: any error → zeroes.
+pub fn read_stats(path: &str) -> Stats {
+    stats_from_db(path).unwrap_or_default()
+}
+
+fn stats_from_db(path: &str) -> Result<Stats> {
+    use rusqlite::{Connection, OpenFlags};
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let crt: i64 = conn.query_row("select crt from col", [], |r| r.get(0))?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let today = (now_secs - crt) / 86_400;
+
+    let mut stmt =
+        conn.prepare("select distinct cast((id/1000 - ?1)/86400 as integer) from revlog where type != 4")?;
+    let days: HashSet<i64> = stmt
+        .query_map([crt], |r| r.get::<_, i64>(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+
+    let mut streak = 0u32;
+    let mut d = if days.contains(&today) { today } else { today - 1 };
+    while days.contains(&d) {
+        streak += 1;
+        d -= 1;
+    }
+
+    let reviewed_today: u32 = conn
+        .query_row(
+            "select count(*) from revlog where type != 4 and cast((id/1000 - ?1)/86400 as integer) = ?2",
+            (crt, today),
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c as u32)
+        .unwrap_or(0);
+
+    Ok(Stats {
+        streak,
+        reviewed_today,
+    })
 }

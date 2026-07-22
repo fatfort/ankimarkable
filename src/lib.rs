@@ -2,6 +2,9 @@
 //! headless screen test (`spike_screen`).
 
 pub mod backend;
+pub mod mathrender;
+pub mod pen;
 pub mod qtfb;
 pub mod render;
 pub mod ui;
+pub mod whiteboard;
