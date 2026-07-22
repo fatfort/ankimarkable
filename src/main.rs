@@ -121,6 +121,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
     let mut counts = Counts::default();
     let mut current: Option<backend::ReviewCard> = None;
     let mut menu_open = false; // ⋮ overflow menu (Bury card / Suspend note)
+    let mut mono = false; // false = colour card rendering, true = black-and-white
     let mut phase = Phase::Question;
     let mut status = String::new();
 
@@ -232,7 +233,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         status = d.name.clone();
                         wb.clear_ink();
                         screen = Screen::Review;
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
                     }
                 }
                 HomeHit::Toggle(i) => {
@@ -327,7 +328,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     phase = Phase::Question;
                     wb.clear_ink();
                 }
-                redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
             }
             Screen::Review => match ui::hit_test(ev.x, ev.y, phase) {
                 Hit::Exit => break,
@@ -358,13 +359,13 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     current = backend.next_card().unwrap_or(None);
                     phase = Phase::Question;
                     wb.clear_ink();
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
                 }
                 Hit::ShowAnswer => {
                     if current.is_some() && phase == Phase::Question {
                         phase = Phase::Answer;
                         // Keep ink so you can compare your answer against the card.
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
                     }
                 }
                 Hit::Grade(g) => {
@@ -379,7 +380,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         current = backend.next_card().unwrap_or(None);
                         phase = Phase::Question;
                         wb.clear_ink(); // next card starts on a clean whiteboard
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
                     }
                 }
                 Hit::Undo => {
@@ -395,7 +396,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                                 wb.clear_ink();
                                 redraw(
                                     &mut qtfb, &renderer, &mut wb, &current, phase, counts,
-                                    &status, menu_open,
+                                    &status, menu_open, mono,
                                 );
                             }
                             _ => {} // nothing to undo
@@ -406,12 +407,17 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                 Hit::EraserToggle => {
                     wb.toggle_eraser();
                     // Recompose so the toolbar reflects the toggle; ink is kept.
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
                 }
                 Hit::Menu => {
                     // Open the ⋮ overflow menu (Bury card / Suspend note).
                     menu_open = true;
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                }
+                Hit::ColorToggle => {
+                    // Tap the counts (top-left) to flip colour / black-and-white.
+                    mono = !mono;
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
                 }
                 Hit::None => {}
             },
@@ -433,14 +439,21 @@ fn redraw(
     counts: Counts,
     status: &str,
     menu_open: bool,
+    mono: bool,
 ) {
     let eraser = wb.eraser;
     let frame = match current {
-        Some(card) => ui::compose_review(renderer, card, phase, counts, status, eraser, menu_open),
-        None => ui::compose_message(
+        Some(card) => {
+            ui::compose_review(renderer, card, phase, counts, status, eraser, menu_open, mono)
+        }
+        // Keep the top menu bar so Home / Sync / Exit still work (an empty deck or
+        // a finished one must not strand you on a chrome-less screen).
+        None => ui::compose_review_empty(
             renderer,
+            counts,
+            status,
             "All done",
-            "No more cards due. Tap Sync to fetch, or Exit.",
+            "No more cards due. Tap Sync to fetch, or Home for another deck.",
         ),
     };
     wb.set_base(frame);

@@ -95,6 +95,8 @@ pub enum Hit {
     EraserToggle,
     /// The ⋮ overflow button (bottom-right) was tapped.
     Menu,
+    /// The counts area (top-left) was tapped — toggle colour / black-and-white.
+    ColorToggle,
     None,
 }
 
@@ -155,7 +157,9 @@ pub fn hit_test(x: i32, y: i32, phase: Phase) -> Hit {
         if x >= edge {
             return Hit::Home;
         }
-        return Hit::None;
+        // Everything left of the buttons is the counts / status area — tap it to
+        // toggle colour vs black-and-white card rendering.
+        return Hit::ColorToggle;
     }
 
     // Bottom action bar.
@@ -199,6 +203,7 @@ pub fn compose_review(
     status: &str,
     eraser: bool,
     menu_open: bool,
+    mono: bool,
 ) -> Vec<u8> {
     let mut fb = vec![255u8; WIDTH * HEIGHT * 4];
 
@@ -206,7 +211,10 @@ pub fn compose_review(
         Phase::Question => &card.question_html,
         Phase::Answer => &card.answer_html,
     };
-    let card_buf = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
+    let mut card_buf = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
+    if mono {
+        desaturate(&mut card_buf); // black-and-white card rendering
+    }
     blit(&mut fb, &card_buf, WIDTH, CARD_H, 0, CARD_Y);
 
     let top_buf = renderer.render_rgba(
@@ -230,6 +238,17 @@ pub fn compose_review(
         draw_menu_panel(&mut fb, renderer);
     }
     fb
+}
+
+/// Desaturate an RGBA buffer in place (luminance grey) for black-and-white mode.
+fn desaturate(buf: &mut [u8]) {
+    for px in buf.chunks_exact_mut(4) {
+        // Rec.601 luma; keep alpha.
+        let l = ((px[0] as u32 * 299 + px[1] as u32 * 587 + px[2] as u32 * 114) / 1000) as u8;
+        px[0] = l;
+        px[1] = l;
+        px[2] = l;
+    }
 }
 
 /// The floating ⋮ button in the card's bottom-right corner.
@@ -278,10 +297,45 @@ pub fn draw_review(
     status: &str,
     eraser: bool,
 ) {
-    let fb = compose_review(renderer, card, phase, counts, status, eraser, false);
+    let fb = compose_review(renderer, card, phase, counts, status, eraser, false, false);
     qtfb.blit_rgba(&fb, WIDTH, HEIGHT, 0, 0);
     let _ = qtfb.set_refresh_mode(REFRESH_MODE_CONTENT);
     let _ = qtfb.update_full();
+}
+
+/// The Review screen with no due card ("All done" / an empty deck): the top menu
+/// bar (so Home / Sync / Exit still work) + a centred message filling the rest.
+pub fn compose_review_empty(
+    renderer: &Renderer,
+    counts: Counts,
+    status: &str,
+    title: &str,
+    body: &str,
+) -> Vec<u8> {
+    let mut fb = vec![255u8; WIDTH * HEIGHT * 4];
+    let area_h = HEIGHT - TOP_H;
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>\
+         body{{margin:0;padding:0 120px;box-sizing:border-box;font-family:sans-serif;\
+         color:#111;background:#fff;height:{ah}px;display:flex;flex-direction:column;\
+         align-items:center;justify-content:center;text-align:center;}}\
+         .t{{font-size:60px;font-weight:700;margin-bottom:24px;}}\
+         .b{{font-size:34px;color:#444;line-height:1.5;max-width:1100px;}}</style></head>\
+         <body><div class=\"t\">{}</div><div class=\"b\">{}</div></body></html>",
+        esc(title),
+        esc(body),
+        ah = area_h
+    );
+    let area = renderer.render_rgba(&html, WIDTH as u32, area_h as u32);
+    blit(&mut fb, &area, WIDTH, area_h, 0, TOP_H);
+    let top = renderer.render_rgba(
+        &top_bar_html(counts, None, status, false),
+        WIDTH as u32,
+        TOP_H as u32,
+    );
+    blit(&mut fb, &top, WIDTH, TOP_H, 0, 0);
+    hline_black(&mut fb, TOP_H - 2, 2);
+    fb
 }
 
 /// Full-screen message (congrats / errors) into a fresh RGBA buffer.
