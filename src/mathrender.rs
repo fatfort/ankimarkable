@@ -96,17 +96,19 @@ impl MathRenderer {
         if !self.enabled {
             return out;
         }
-        // Collect the unique, not-yet-cached math bodies and render them all in
+        // Collect the unique, not-yet-cached math spans (keyed by tex + inline-ness,
+        // since inline and display crop the PNG differently) and render them all in
         // ONE mathpng invocation (amortises the engine init across the card).
-        let mut todo: Vec<String> = Vec::new();
+        let mut todo: Vec<(String, bool)> = Vec::new();
         {
             let cache = self.math_cache.borrow();
             let mut seen: HashSet<u64> = HashSet::new();
             for c in self.re_math.captures_iter(&out) {
+                let inline = c.get(1).is_some();
                 let tex = span_tex(&c);
-                let key = tex_key(&tex);
+                let key = tex_key(&tex, inline);
                 if !cache.contains_key(&key) && seen.insert(key) {
-                    todo.push(tex);
+                    todo.push((tex, inline));
                 }
             }
         }
@@ -117,7 +119,7 @@ impl MathRenderer {
             .replace_all(&out, |c: &regex::Captures| {
                 let inline = c.get(1).is_some();
                 let tex = span_tex(c);
-                match cache.get(&tex_key(&tex)).and_then(|o| o.as_ref()) {
+                match cache.get(&tex_key(&tex, inline)).and_then(|o| o.as_ref()) {
                     Some(r) => img_tag(r, inline),
                     // Unrenderable (e.g. a \begin{tikzpicture}) — leave the raw
                     // source, escaped, so it's at least visible (no worse).
@@ -127,11 +129,17 @@ impl MathRenderer {
             .into_owned()
     }
 
-    /// Render a batch of TeX bodies via the microtex helper, populating the cache.
-    fn render_batch(&self, texs: &[String]) {
-        if texs.is_empty() {
+    /// Render a batch of (tex, inline) spans via the microtex helper, populating
+    /// the cache. Inline math is finalized to a UNIFORM baseline-to-bottom distance
+    /// so every inline formula aligns the same way (parley bottom-pins the image to
+    /// the text baseline and ignores vertical-align); display math keeps full ink.
+    fn render_batch(&self, spans: &[(String, bool)]) {
+        if spans.is_empty() {
             return;
         }
+        // key -> inline?, so the stdout pass knows how to finalize each PNG.
+        let inline_by_key: HashMap<u64, bool> =
+            spans.iter().map(|(t, i)| (tex_key(t, *i), *i)).collect();
         let spawned = Command::new(&self.mathpng)
             .arg(&self.cache_dir)
             .env("QT_QPA_PLATFORM", "offscreen")
@@ -142,13 +150,13 @@ impl MathRenderer {
             .spawn();
         let mut child = match spawned {
             Ok(c) => c,
-            Err(_) => return self.mark_failed(texs),
+            Err(_) => return self.mark_failed(spans),
         };
         // Feed one request per line: <hash>\t<pt>\t<tex>. mathpng echoes <hash>
         // back and names its output <hash>.png.
         if let Some(mut stdin) = child.stdin.take() {
-            for tex in texs {
-                let key = tex_key(tex);
+            for (tex, inline) in spans {
+                let key = tex_key(tex, *inline);
                 let clean = tex.replace(['\t', '\n', '\r'], " ");
                 let _ = writeln!(stdin, "{key:016x}\t{RENDER_PT}\t{clean}");
             }
@@ -156,10 +164,9 @@ impl MathRenderer {
         }
         let output = match child.wait_with_output() {
             Ok(o) => o,
-            Err(_) => return self.mark_failed(texs),
+            Err(_) => return self.mark_failed(spans),
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut got: HashSet<u64> = HashSet::new();
         let mut cache = self.math_cache.borrow_mut();
         for line in stdout.lines() {
             // <hash>\t<baseline|ERR>\t<w>\t<h>
@@ -170,19 +177,16 @@ impl MathRenderer {
             let Ok(key) = u64::from_str_radix(hh, 16) else {
                 continue;
             };
-            got.insert(key);
             if f1 == "ERR" {
                 cache.insert(key, None);
                 continue;
             }
-            // mathpng's reported w/h/baseline are only used to spot a successful
-            // render — we re-derive the geometry after cropping the PNG to its ink
-            // (parley pins an inline image's BOTTOM to the text baseline and ignores
-            // vertical-align, so a tight ink box is what lands math on the baseline).
+            let baseline: f32 = f1.parse().unwrap_or(0.0);
+            let inline = inline_by_key.get(&key).copied().unwrap_or(true);
             let png_path = self.cache_dir.join(format!("{hh}.png"));
             let done = std::fs::read(&png_path)
                 .ok()
-                .and_then(|p| finalize_math_png(&p))
+                .and_then(|p| finalize_math_png(&p, inline, baseline))
                 .map(|(png, w, h)| Rendered {
                     uri: png_data_uri(&png),
                     w,
@@ -191,16 +195,16 @@ impl MathRenderer {
             cache.insert(key, done);
         }
         // Anything the helper never answered for -> failed (leave raw).
-        for tex in texs {
-            cache.entry(tex_key(tex)).or_insert(None);
-            let _ = &got; // (all keys we sent are either answered or defaulted here)
+        for (tex, inline) in spans {
+            cache.entry(tex_key(tex, *inline)).or_insert(None);
         }
     }
 
-    fn mark_failed(&self, texs: &[String]) {
+    fn mark_failed(&self, spans: &[(String, bool)]) {
         let mut cache = self.math_cache.borrow_mut();
-        for tex in texs {
-            cache.entry(tex_key(tex)).or_insert(None);
+        for (tex, inline) in spans {
+            let key = tex_key(tex, *inline);
+            cache.entry(key).or_insert(None);
         }
     }
 
@@ -261,10 +265,22 @@ fn img_tag(r: &Rendered, inline: bool) -> String {
     }
 }
 
-/// Decode a mathpng PNG (transparent bg, dark grey ink), crop tightly to the ink,
-/// force the ink to PURE BLACK (max e-ink contrast; mathpng renders it ~#222) while
-/// keeping the anti-alias alpha, and re-encode. Returns (png, cropped_w, cropped_h).
-fn finalize_math_png(png: &[u8]) -> Option<(Vec<u8>, f32, f32)> {
+/// Space (fraction of RENDER_PT) kept below the math baseline for INLINE formulas.
+/// Fixed for ALL inline math so every formula aligns identically (parley bottom-pins
+/// the image to the text baseline); big enough to hold typical subscript descenders.
+const INLINE_DESCENT: f32 = 0.16;
+
+/// Decode a mathpng PNG (transparent bg, dark grey ink), crop it, force the ink to
+/// PURE BLACK (max e-ink contrast; mathpng renders it ~#222) keeping the anti-alias
+/// alpha, and re-encode. Returns (png, w, h).
+///
+/// - `inline`: the image BOTTOM is fixed at `baseline + INLINE_DESCENT` (padding short
+///   formulas, clipping only very deep descenders) so all inline math shares one
+///   baseline offset. Display math (`inline=false`) crops to full ink so tall
+///   `\sum`/fraction descenders survive.
+/// - Horizontal crop keeps a generous margin + uses a low alpha threshold so slanted
+///   italic glyph edges (e.g. an italic F) aren't clipped on the right.
+fn finalize_math_png(png: &[u8], inline: bool, baseline: f32) -> Option<(Vec<u8>, f32, f32)> {
     let pm = tiny_skia::Pixmap::decode_png(png).ok()?;
     let (w, h) = (pm.width() as usize, pm.height() as usize);
     let src = pm.data(); // premultiplied RGBA; transparent bg has alpha 0.
@@ -272,7 +288,8 @@ fn finalize_math_png(png: &[u8]) -> Option<(Vec<u8>, f32, f32)> {
     let mut any = false;
     for y in 0..h {
         for x in 0..w {
-            if src[(y * w + x) * 4 + 3] > 16 {
+            // Low threshold so faint anti-aliased edge pixels count → no edge clip.
+            if src[(y * w + x) * 4 + 3] > 6 {
                 any = true;
                 minx = minx.min(x);
                 maxx = maxx.max(x);
@@ -284,19 +301,36 @@ fn finalize_math_png(png: &[u8]) -> Option<(Vec<u8>, f32, f32)> {
     if !any {
         return None;
     }
-    let m = 2usize; // hairline margin so edge AA isn't clipped
-    let x0 = minx.saturating_sub(m);
-    let y0 = miny.saturating_sub(m);
-    let x1 = (maxx + m).min(w - 1);
-    let y1 = (maxy + m).min(h - 1);
+    let mx = 6usize; // horizontal margin — italic glyph right edges need headroom
+    let mt = 3usize; // top margin
+    let x0 = minx.saturating_sub(mx);
+    let x1 = (maxx + mx).min(w - 1);
+    let y0 = miny.saturating_sub(mt);
+    let y1 = if inline {
+        // Uniform bottom = baseline + a fixed descent. May sit past the source image
+        // (transparent padding for descenderless formulas) — that's the point.
+        let desc = (INLINE_DESCENT * RENDER_PT) as usize;
+        (baseline.round().max(0.0) as usize)
+            .saturating_add(desc)
+            .max(y0 + 1)
+            .min(y0 + 4000)
+    } else {
+        (maxy + mt).min(h - 1)
+    };
     let (cw, ch) = (x1 - x0 + 1, y1 - y0 + 1);
     let mut out = tiny_skia::Pixmap::new(cw as u32, ch as u32)?;
     let dst = out.data_mut();
     for y in 0..ch {
+        let sy = y0 + y;
         for x in 0..cw {
-            let a = src[((y0 + y) * w + (x0 + x)) * 4 + 3];
+            let sx = x0 + x;
+            // Rows/cols past the source (inline bottom padding) are transparent.
+            let a = if sy < h && sx < w {
+                src[(sy * w + sx) * 4 + 3]
+            } else {
+                0
+            };
             let di = (y * cw + x) * 4;
-            // Pure black at the source alpha (premultiplied black = 0,0,0,a).
             dst[di] = 0;
             dst[di + 1] = 0;
             dst[di + 2] = 0;
@@ -306,9 +340,10 @@ fn finalize_math_png(png: &[u8]) -> Option<(Vec<u8>, f32, f32)> {
     Some((out.encode_png().ok()?, cw as f32, ch as f32))
 }
 
-fn tex_key(tex: &str) -> u64 {
+fn tex_key(tex: &str, inline: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     tex.hash(&mut h);
+    inline.hash(&mut h);
     // Fold in the render size so a size change invalidates stale cache entries.
     (RENDER_PT as u32).hash(&mut h);
     h.finish()
