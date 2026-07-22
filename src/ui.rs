@@ -6,7 +6,7 @@
 //! `body{}`/`.card{}` CSS from bleeding into our chrome. Hit-rects are defined here
 //! in Rust to match the geometry of the HTML we generate.
 
-use crate::backend::{Counts, Grade, ReviewCard};
+use crate::backend::{Counts, DeckInfo, Grade, ReviewCard, Stats};
 use crate::qtfb::{Qtfb, REFRESH_MODE_CONTENT};
 use crate::render::Renderer;
 
@@ -17,8 +17,24 @@ pub const BOTTOM_H: usize = 240;
 pub const CARD_Y: usize = TOP_H;
 pub const CARD_H: usize = HEIGHT - TOP_H - BOTTOM_H;
 
-const SYNC_W: usize = 240;
-const EXIT_W: usize = 200;
+// Review top-bar buttons, right-to-left: [counts][Home][Undo][Eraser][Clear][Sync][Exit].
+const HOME_W: usize = 160;
+const UNDO_W: usize = 160;
+const ERASE_W: usize = 180;
+const CLEAR_W: usize = 160;
+const SYNC_W: usize = 190;
+const EXIT_W: usize = 160;
+
+// Home-screen deck list geometry (hit_test_home must match compose_home's CSS).
+pub const HOME_ROW_H: usize = 116;
+const HOME_INDENT: usize = 46; // px per tree level
+const HOME_PAD_L: usize = 32; // list left padding
+const HOME_CHEV_W: usize = 84; // chevron tap zone width (after indent)
+const SCROLL_BTN_W: usize = 88; // ▲/▼ header buttons
+/// Visible deck rows that fit under the header.
+pub fn home_page_rows() -> usize {
+    (HEIGHT - TOP_H) / HOME_ROW_H
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -32,6 +48,23 @@ pub enum Hit {
     Grade(Grade),
     Sync,
     Exit,
+    Home,
+    Undo,
+    Clear,
+    EraserToggle,
+    None,
+}
+
+/// A tap on the home screen. `Deck`/`Toggle` carry the absolute index into the
+/// visible deck list.
+#[derive(Clone, Copy, Debug)]
+pub enum HomeHit {
+    Deck(usize),
+    Toggle(usize),
+    Sync,
+    Exit,
+    ScrollUp,
+    ScrollDown,
     None,
 }
 
@@ -42,13 +75,33 @@ pub fn hit_test(x: i32, y: i32, phase: Phase) -> Hit {
     }
     let (x, y) = (x as usize, y as usize);
 
-    // Top status bar: [counts ............ Sync | Exit]
+    // Top status bar: [counts .... Home | Undo | Eraser | Clear | Sync | Exit]
+    // (right-to-left, must mirror top_bar_html's button order).
     if y < TOP_H {
-        if x >= WIDTH - EXIT_W {
+        let mut edge = WIDTH;
+        edge -= EXIT_W;
+        if x >= edge {
             return Hit::Exit;
         }
-        if x >= WIDTH - EXIT_W - SYNC_W {
+        edge -= SYNC_W;
+        if x >= edge {
             return Hit::Sync;
+        }
+        edge -= CLEAR_W;
+        if x >= edge {
+            return Hit::Clear;
+        }
+        edge -= ERASE_W;
+        if x >= edge {
+            return Hit::EraserToggle;
+        }
+        edge -= UNDO_W;
+        if x >= edge {
+            return Hit::Undo;
+        }
+        edge -= HOME_W;
+        if x >= edge {
+            return Hit::Home;
         }
         return Hit::None;
     }
@@ -70,12 +123,11 @@ pub fn hit_test(x: i32, y: i32, phase: Phase) -> Hit {
         };
     }
 
-    // Tapping the card during the question reveals the answer (convenience).
-    if phase == Phase::Question {
-        Hit::ShowAnswer
-    } else {
-        Hit::None
-    }
+    // Card region: IGNORE touches. The pen draws here and the palm rests here while
+    // writing — a card tap must NOT reveal the answer or act (that fired "show
+    // answer on its own"). Reveal is the deliberate Show Answer button only.
+    let _ = phase;
+    Hit::None
 }
 
 /// Composite a full review frame into a fresh WIDTH×HEIGHT RGBA buffer (white bg).
@@ -86,6 +138,7 @@ pub fn compose_review(
     phase: Phase,
     counts: Counts,
     status: &str,
+    eraser: bool,
 ) -> Vec<u8> {
     let mut fb = vec![255u8; WIDTH * HEIGHT * 4];
 
@@ -96,7 +149,8 @@ pub fn compose_review(
     let card_buf = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
     blit(&mut fb, &card_buf, WIDTH, CARD_H, 0, CARD_Y);
 
-    let top_buf = renderer.render_rgba(&top_bar_html(counts, status), WIDTH as u32, TOP_H as u32);
+    let top_buf =
+        renderer.render_rgba(&top_bar_html(counts, status, eraser), WIDTH as u32, TOP_H as u32);
     blit(&mut fb, &top_buf, WIDTH, TOP_H, 0, 0);
 
     let bot_buf =
@@ -116,8 +170,9 @@ pub fn draw_review(
     phase: Phase,
     counts: Counts,
     status: &str,
+    eraser: bool,
 ) {
-    let fb = compose_review(renderer, card, phase, counts, status);
+    let fb = compose_review(renderer, card, phase, counts, status, eraser);
     qtfb.blit_rgba(&fb, WIDTH, HEIGHT, 0, 0);
     let _ = qtfb.set_refresh_mode(REFRESH_MODE_CONTENT);
     let _ = qtfb.update_full();
@@ -127,15 +182,164 @@ pub fn draw_review(
 pub fn compose_message(renderer: &Renderer, title: &str, body: &str) -> Vec<u8> {
     let html = format!(
         "<!DOCTYPE html><html><head><style>\
-         body{{font-family:sans-serif;margin:0;padding:0;color:#111;background:#fff;\
+         body{{font-family:sans-serif;margin:0;padding:0 120px;box-sizing:border-box;\
+         color:#111;background:#fff;text-align:center;\
          display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;}}\
-         .t{{font-size:64px;font-weight:700;margin-bottom:24px;}}\
-         .b{{font-size:36px;color:#444;}}</style></head>\
+         .t{{font-size:64px;font-weight:700;margin-bottom:28px;}}\
+         .b{{font-size:36px;color:#444;line-height:1.5;max-width:1100px;}}</style></head>\
          <body><div class=\"t\">{}</div><div class=\"b\">{}</div></body></html>",
         esc(title),
         esc(body)
     );
     renderer.render_rgba(&html, WIDTH as u32, HEIGHT as u32)
+}
+
+/// Map a tap on the home screen to an action. `visible` is the collapse-filtered
+/// deck list; `scroll` is the first displayed row. Geometry must match `compose_home`.
+pub fn hit_test_home(x: i32, y: i32, visible: &[DeckInfo], scroll: usize) -> HomeHit {
+    if x < 0 || y < 0 {
+        return HomeHit::None;
+    }
+    let (x, y) = (x as usize, y as usize);
+    if y < TOP_H {
+        let mut edge = WIDTH;
+        edge -= EXIT_W;
+        if x >= edge {
+            return HomeHit::Exit;
+        }
+        edge -= SYNC_W;
+        if x >= edge {
+            return HomeHit::Sync;
+        }
+        edge -= SCROLL_BTN_W;
+        if x >= edge {
+            return HomeHit::ScrollDown;
+        }
+        edge -= SCROLL_BTN_W;
+        if x >= edge {
+            return HomeHit::ScrollUp;
+        }
+        return HomeHit::None;
+    }
+    let idx = scroll + (y - TOP_H) / HOME_ROW_H;
+    let Some(d) = visible.get(idx) else {
+        return HomeHit::None;
+    };
+    // Chevron zone (parents only) toggles collapse; the rest reviews the deck.
+    if d.has_children {
+        let indent = HOME_PAD_L + d.level as usize * HOME_INDENT;
+        if x >= indent && x < indent + HOME_CHEV_W {
+            return HomeHit::Toggle(idx);
+        }
+    }
+    HomeHit::Deck(idx)
+}
+
+/// Home screen: header (title + streak + scroll + Sync/Exit) over a collapsible,
+/// paged deck tree. Renders `visible[scroll ..]` for one page.
+pub fn compose_home(
+    renderer: &Renderer,
+    visible: &[DeckInfo],
+    scroll: usize,
+    stats: Stats,
+) -> Vec<u8> {
+    let chip = |v: u32, color: &str| {
+        if v == 0 {
+            "<span class=\"z\">0</span>".to_string()
+        } else {
+            format!("<span class=\"{color}\">{v}</span>")
+        }
+    };
+    let fit = home_page_rows();
+    let end = (scroll + fit).min(visible.len());
+    let mut rows = String::new();
+    for d in visible.get(scroll..end).unwrap_or(&[]) {
+        let cls = if d.name == "uni" && d.level == 0 {
+            "row uni"
+        } else {
+            "row"
+        };
+        let pad = HOME_PAD_L + d.level as usize * HOME_INDENT;
+        let chev = if !d.has_children {
+            ""
+        } else if d.collapsed {
+            "&#9656;" // ▸
+        } else {
+            "&#9662;" // ▾
+        };
+        rows.push_str(&format!(
+            "<div class=\"{cls}\" style=\"padding-left:{pad}px;\">\
+             <div class=\"chev\">{chev}</div><div class=\"nm\">{name}</div>\
+             <div class=\"chips\">{n}{l}{r}</div></div>",
+            name = esc(&d.name),
+            n = chip(d.new, "n"),
+            l = chip(d.learn, "l"),
+            r = chip(d.review, "r"),
+        ));
+    }
+    let more = if visible.len() > fit {
+        format!(
+            "<div class=\"pos\">{}\u{2013}{} / {}</div>",
+            (scroll + 1).min(visible.len().max(1)),
+            end,
+            visible.len()
+        )
+    } else {
+        String::new()
+    };
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
+         html,body{{margin:0;padding:0;background:#fff;color:#111;font-family:sans-serif;}}\
+         .top{{height:{top}px;display:flex;align-items:center;box-sizing:border-box;\
+         border-bottom:3px solid #000;}}\
+         .title{{font-size:44px;font-weight:800;padding-left:36px;}}\
+         .pos{{font-size:26px;color:#888;padding-left:20px;}} .sp{{flex:1;}}\
+         .streak{{font-size:30px;color:#555;padding-right:22px;white-space:nowrap;}}\
+         .btn{{font-size:34px;font-weight:700;color:#fff;height:{top}px;display:flex;\
+         align-items:center;justify-content:center;border-left:2px solid #fff;box-sizing:border-box;}}\
+         .up,.dn{{width:{scr}px;background:#607d8b;}}\
+         .sync{{width:{sync}px;background:#455a64;}} .exit{{width:{exit}px;background:#333;}}\
+         .row{{height:{rowh}px;display:flex;align-items:center;box-sizing:border-box;\
+         border-bottom:1px solid #dddddd;padding-right:40px;}}\
+         .row.uni{{background:#eef4ff;}}\
+         .chev{{width:{chevw}px;font-size:34px;color:#888;flex:none;}}\
+         .nm{{flex:1;font-size:40px;font-weight:600;overflow:hidden;white-space:nowrap;\
+         text-overflow:ellipsis;}}\
+         .row.uni .nm{{color:#1565c0;font-weight:800;}}\
+         .chips{{font-size:32px;font-weight:700;white-space:nowrap;}}\
+         .chips span{{margin-left:32px;display:inline-block;min-width:1.1em;text-align:right;}}\
+         .n{{color:#1565c0;}} .l{{color:#c62828;}} .r{{color:#2e7d32;}} .z{{color:#c8c8c8;}}</style></head>\
+         <body><div class=\"top\"><div class=\"title\">Decks</div>{more}<div class=\"sp\"></div>\
+         <div class=\"streak\">&#128293; {streak} day streak &#183; {today} today</div>\
+         <div class=\"btn up\">&#9650;</div><div class=\"btn dn\">&#9660;</div>\
+         <div class=\"btn sync\">Sync</div><div class=\"btn exit\">Exit</div></div>\
+         {rows}</body></html>",
+        top = TOP_H,
+        scr = SCROLL_BTN_W,
+        sync = SYNC_W,
+        exit = EXIT_W,
+        rowh = HOME_ROW_H,
+        chevw = HOME_CHEV_W,
+        more = more,
+        streak = stats.streak,
+        today = stats.reviewed_today,
+        rows = rows,
+    );
+    renderer.render_rgba(&html, WIDTH as u32, HEIGHT as u32)
+}
+
+/// Composite + push the home screen.
+pub fn draw_home(
+    qtfb: &mut Qtfb,
+    renderer: &Renderer,
+    visible: &[DeckInfo],
+    scroll: usize,
+    stats: Stats,
+) {
+    let fb = compose_home(renderer, visible, scroll, stats);
+    qtfb.blit_rgba(&fb, WIDTH, HEIGHT, 0, 0);
+    let _ = qtfb.set_refresh_mode(REFRESH_MODE_CONTENT);
+    let _ = qtfb.update_full();
 }
 
 /// Full-screen message (congrats / errors).
@@ -195,21 +399,41 @@ fn hline_black(dst: &mut [u8], y: usize, thickness: usize) {
     }
 }
 
-fn top_bar_html(counts: Counts, status: &str) -> String {
+fn top_bar_html(counts: Counts, status: &str, eraser: bool) -> String {
+    // Eraser button reflects its toggle state (inverted when active).
+    let (erase_bg, erase_fg) = if eraser {
+        ("#111", "#fff")
+    } else {
+        ("#e8e8e8", "#333")
+    };
     format!(
         "<!DOCTYPE html><html><head><style>\
          body{{font-family:sans-serif;margin:0;padding:0;height:100%;color:#111;background:#fff;\
          display:flex;align-items:center;}}\
-         .counts{{flex:1;font-size:34px;padding-left:32px;}}\
+         .counts{{flex:1;font-size:34px;padding-left:32px;white-space:nowrap;}}\
          .n{{color:#1565c0;font-weight:700;}} .l{{color:#c62828;font-weight:700;}} \
-         .r{{color:#2e7d32;font-weight:700;}} .status{{font-size:26px;color:#666;padding-right:24px;}}\
-         .btn{{font-size:32px;font-weight:700;text-align:center;color:#fff;background:#555;\
-         height:100%;display:flex;align-items:center;justify-content:center;}}\
-         .sync{{width:{sync}px;}} .exit{{width:{exit}px;background:#333;}}</style></head>\
+         .r{{color:#2e7d32;font-weight:700;}} .status{{font-size:24px;color:#666;padding-right:20px;\
+         overflow:hidden;text-overflow:ellipsis;max-width:360px;}}\
+         .btn{{font-size:30px;font-weight:700;text-align:center;color:#fff;\
+         height:100%;display:flex;align-items:center;justify-content:center;\
+         border-left:2px solid #fff;}}\
+         .home{{width:{home}px;background:#37474f;}}\
+         .undo{{width:{undo}px;background:#607d8b;}}\
+         .erase{{width:{erase}px;background:{erase_bg};color:{erase_fg};}}\
+         .clear{{width:{clear}px;background:#8d6e63;}}\
+         .sync{{width:{sync}px;background:#455a64;}} .exit{{width:{exit}px;background:#333;}}</style></head>\
          <body><div class=\"counts\"><span class=\"n\">{new}</span> &nbsp; \
          <span class=\"l\">{learn}</span> &nbsp; <span class=\"r\">{rev}</span></div>\
          <div class=\"status\">{status}</div>\
+         <div class=\"btn home\">Home</div>\
+         <div class=\"btn undo\">Undo</div>\
+         <div class=\"btn erase\">Eraser</div>\
+         <div class=\"btn clear\">Clear</div>\
          <div class=\"btn sync\">Sync</div><div class=\"btn exit\">Exit</div></body></html>",
+        home = HOME_W,
+        undo = UNDO_W,
+        erase = ERASE_W,
+        clear = CLEAR_W,
         sync = SYNC_W,
         exit = EXIT_W,
         new = counts.new,
