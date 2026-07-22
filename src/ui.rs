@@ -6,13 +6,13 @@
 //! `body{}`/`.card{}` CSS from bleeding into our chrome. Hit-rects are defined here
 //! in Rust to match the geometry of the HTML we generate.
 
-use crate::backend::{Counts, DeckInfo, Grade, ReviewCard, Stats};
+use crate::backend::{CardKind, Counts, DeckInfo, Grade, ReviewCard, Stats};
 use crate::qtfb::{Qtfb, REFRESH_MODE_CONTENT};
 use crate::render::Renderer;
 
 pub const WIDTH: usize = 1620;
 pub const HEIGHT: usize = 2160;
-pub const TOP_H: usize = 130;
+pub const TOP_H: usize = 110;
 pub const BOTTOM_H: usize = 240;
 pub const CARD_Y: usize = TOP_H;
 pub const CARD_H: usize = HEIGHT - TOP_H - BOTTOM_H;
@@ -24,6 +24,47 @@ const ERASE_W: usize = 180;
 const CLEAR_W: usize = 160;
 const SYNC_W: usize = 190;
 const EXIT_W: usize = 160;
+
+// ⋮ overflow menu: a floating button in the card's bottom-right corner, with a
+// popup panel above it (Bury card / Suspend note).
+pub const MENU_BTN: usize = 104;
+const MENU_GAP: usize = 30; // inset from the right edge / bottom action bar
+const MENU_PANEL_W: usize = 520;
+const MENU_ITEM_H: usize = 118;
+const MENU_ITEMS: usize = 2;
+
+fn menu_btn_rect() -> (usize, usize, usize, usize) {
+    let x1 = WIDTH - MENU_GAP;
+    let x0 = x1 - MENU_BTN;
+    let y1 = HEIGHT - BOTTOM_H - MENU_GAP;
+    let y0 = y1 - MENU_BTN;
+    (x0, y0, x1, y1)
+}
+
+fn menu_panel_rect() -> (usize, usize, usize, usize) {
+    let (_, by0, bx1, _) = menu_btn_rect();
+    let x1 = bx1;
+    let x0 = x1 - MENU_PANEL_W;
+    let y1 = by0 - 14;
+    let y0 = y1 - MENU_ITEM_H * MENU_ITEMS;
+    (x0, y0, x1, y1)
+}
+
+/// Hit-test a tap while the ⋮ menu is open: a panel item, else None (dismiss).
+pub fn hit_menu(x: i32, y: i32) -> MenuHit {
+    if x < 0 || y < 0 {
+        return MenuHit::None;
+    }
+    let (x, y) = (x as usize, y as usize);
+    let (px0, py0, px1, py1) = menu_panel_rect();
+    if x >= px0 && x < px1 && y >= py0 && y < py1 {
+        return match (y - py0) / MENU_ITEM_H {
+            0 => MenuHit::Bury,
+            _ => MenuHit::Suspend,
+        };
+    }
+    MenuHit::None
+}
 
 // Home-screen deck list geometry (hit_test_home must match compose_home's CSS).
 pub const HOME_ROW_H: usize = 116;
@@ -52,6 +93,17 @@ pub enum Hit {
     Undo,
     Clear,
     EraserToggle,
+    /// The ⋮ overflow button (bottom-right) was tapped.
+    Menu,
+    None,
+}
+
+/// A tap while the ⋮ overflow menu is open.
+#[derive(Clone, Copy, Debug)]
+pub enum MenuHit {
+    Bury,
+    Suspend,
+    /// Tapped outside the panel — dismiss it.
     None,
 }
 
@@ -123,6 +175,13 @@ pub fn hit_test(x: i32, y: i32, phase: Phase) -> Hit {
         };
     }
 
+    // The ⋮ overflow button floats in the card's bottom-right corner — a small,
+    // deliberate target checked BEFORE the card-region palm ignore below.
+    let (mx0, my0, mx1, my1) = menu_btn_rect();
+    if x >= mx0 && x < mx1 && y >= my0 && y < my1 {
+        return Hit::Menu;
+    }
+
     // Card region: IGNORE touches. The pen draws here and the palm rests here while
     // writing — a card tap must NOT reveal the answer or act (that fired "show
     // answer on its own"). Reveal is the deliberate Show Answer button only.
@@ -139,6 +198,7 @@ pub fn compose_review(
     counts: Counts,
     status: &str,
     eraser: bool,
+    menu_open: bool,
 ) -> Vec<u8> {
     let mut fb = vec![255u8; WIDTH * HEIGHT * 4];
 
@@ -149,8 +209,11 @@ pub fn compose_review(
     let card_buf = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
     blit(&mut fb, &card_buf, WIDTH, CARD_H, 0, CARD_Y);
 
-    let top_buf =
-        renderer.render_rgba(&top_bar_html(counts, status, eraser), WIDTH as u32, TOP_H as u32);
+    let top_buf = renderer.render_rgba(
+        &top_bar_html(counts, Some(card.kind), status, eraser),
+        WIDTH as u32,
+        TOP_H as u32,
+    );
     blit(&mut fb, &top_buf, WIDTH, TOP_H, 0, 0);
 
     let bot_buf =
@@ -159,7 +222,50 @@ pub fn compose_review(
 
     hline_black(&mut fb, CARD_Y - 2, 2);
     hline_black(&mut fb, HEIGHT - BOTTOM_H, 2);
+
+    // ⋮ overflow button (always) + its popup panel (when open), drawn last so they
+    // sit on top of the card.
+    draw_menu_button(&mut fb, renderer);
+    if menu_open {
+        draw_menu_panel(&mut fb, renderer);
+    }
     fb
+}
+
+/// The floating ⋮ button in the card's bottom-right corner.
+fn draw_menu_button(fb: &mut [u8], renderer: &Renderer) {
+    let (x0, y0, _, _) = menu_btn_rect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>body{{margin:0;padding:0;}}\
+         .m{{width:{n}px;height:{n}px;background:#37474f;color:#fff;box-sizing:border-box;\
+         display:flex;align-items:center;justify-content:center;\
+         font-size:82px;font-weight:700;border-radius:18px;}}</style></head>\
+         <body><div class=\"m\">\u{22EE}</div></body></html>",
+        n = MENU_BTN
+    );
+    let buf = renderer.render_rgba(&html, MENU_BTN as u32, MENU_BTN as u32);
+    blit(fb, &buf, MENU_BTN, MENU_BTN, x0, y0);
+}
+
+/// The popup panel above the ⋮ button: Bury card / Suspend note.
+fn draw_menu_panel(fb: &mut [u8], renderer: &Renderer) {
+    let (x0, y0, x1, y1) = menu_panel_rect();
+    let (w, h) = (x1 - x0, y1 - y0);
+    let html = format!(
+        "<!DOCTYPE html><html><head><style>body{{margin:0;padding:0;}}\
+         .p{{width:{w}px;height:{h}px;background:#fff;border:3px solid #333;box-sizing:border-box;}}\
+         .it{{height:{ih}px;display:flex;align-items:center;padding-left:36px;\
+         font-size:46px;color:#111;box-sizing:border-box;}}\
+         .top{{border-bottom:2px solid #cccccc;}}</style></head>\
+         <body><div class=\"p\">\
+         <div class=\"it top\">Bury card</div>\
+         <div class=\"it\">Suspend note</div></div></body></html>",
+        w = w,
+        h = h,
+        ih = MENU_ITEM_H
+    );
+    let buf = renderer.render_rgba(&html, w as u32, h as u32);
+    blit(fb, &buf, w, h, x0, y0);
 }
 
 /// Composite + push a full review frame.
@@ -172,7 +278,7 @@ pub fn draw_review(
     status: &str,
     eraser: bool,
 ) {
-    let fb = compose_review(renderer, card, phase, counts, status, eraser);
+    let fb = compose_review(renderer, card, phase, counts, status, eraser, false);
     qtfb.blit_rgba(&fb, WIDTH, HEIGHT, 0, 0);
     let _ = qtfb.set_refresh_mode(REFRESH_MODE_CONTENT);
     let _ = qtfb.update_full();
@@ -399,37 +505,54 @@ fn hline_black(dst: &mut [u8], y: usize, thickness: usize) {
     }
 }
 
-fn top_bar_html(counts: Counts, status: &str, eraser: bool) -> String {
+fn top_bar_html(counts: Counts, kind: Option<CardKind>, status: &str, eraser: bool) -> String {
     // Eraser button reflects its toggle state (inverted when active).
     let (erase_bg, erase_fg) = if eraser {
         ("#111", "#fff")
     } else {
         ("#e8e8e8", "#333")
     };
+    // Underline the count that matches the current card (new/learning/review).
+    let cls = |k: CardKind, base: &str| {
+        if kind == Some(k) {
+            format!("{base} und")
+        } else {
+            base.to_string()
+        }
+    };
+    let (nc, lc, rc) = (
+        cls(CardKind::New, "n"),
+        cls(CardKind::Learning, "l"),
+        cls(CardKind::Review, "r"),
+    );
     format!(
         "<!DOCTYPE html><html><head><style>\
-         body{{font-family:sans-serif;margin:0;padding:0;height:100%;color:#111;background:#fff;\
+         body{{font-family:sans-serif;margin:0;padding:0;height:{top}px;color:#111;background:#fff;\
          display:flex;align-items:center;}}\
-         .counts{{flex:1;font-size:34px;padding-left:32px;white-space:nowrap;}}\
+         .counts{{flex:1;display:flex;align-items:center;gap:26px;\
+         font-size:42px;padding-left:32px;}}\
          .n{{color:#1565c0;font-weight:700;}} .l{{color:#c62828;font-weight:700;}} \
-         .r{{color:#2e7d32;font-weight:700;}} .status{{font-size:24px;color:#666;padding-right:20px;\
+         .r{{color:#2e7d32;font-weight:700;}} \
+         .und{{border-bottom:7px solid;}}\
+         .status{{font-size:24px;color:#666;padding-right:20px;\
          overflow:hidden;text-overflow:ellipsis;max-width:360px;}}\
          .btn{{font-size:30px;font-weight:700;text-align:center;color:#fff;\
-         height:100%;display:flex;align-items:center;justify-content:center;\
+         height:{top}px;display:flex;align-items:center;justify-content:center;\
          border-left:2px solid #fff;}}\
          .home{{width:{home}px;background:#37474f;}}\
          .undo{{width:{undo}px;background:#607d8b;}}\
          .erase{{width:{erase}px;background:{erase_bg};color:{erase_fg};}}\
          .clear{{width:{clear}px;background:#8d6e63;}}\
          .sync{{width:{sync}px;background:#455a64;}} .exit{{width:{exit}px;background:#333;}}</style></head>\
-         <body><div class=\"counts\"><span class=\"n\">{new}</span> &nbsp; \
-         <span class=\"l\">{learn}</span> &nbsp; <span class=\"r\">{rev}</span></div>\
+         <body><div class=\"counts\"><span class=\"{nc}\">{new}</span>\
+         <span class=\"{lc}\">{learn}</span><span class=\"{rc}\">{rev}</span></div>\
          <div class=\"status\">{status}</div>\
          <div class=\"btn home\">Home</div>\
          <div class=\"btn undo\">Undo</div>\
          <div class=\"btn erase\">Eraser</div>\
          <div class=\"btn clear\">Clear</div>\
          <div class=\"btn sync\">Sync</div><div class=\"btn exit\">Exit</div></body></html>",
+        top = TOP_H,
         home = HOME_W,
         undo = UNDO_W,
         erase = ERASE_W,
@@ -443,6 +566,7 @@ fn top_bar_html(counts: Counts, status: &str, eraser: bool) -> String {
     )
 }
 
+
 fn bottom_bar_html(card: &ReviewCard, phase: Phase) -> String {
     let head = "<!DOCTYPE html><html><head><style>\
         body{font-family:sans-serif;margin:0;padding:0;height:100%;background:#fff;}\
@@ -451,7 +575,7 @@ fn bottom_bar_html(card: &ReviewCard, phase: Phase) -> String {
         border-left:2px solid #fff;}\
         .name{font-size:40px;font-weight:700;color:#fff;}\
         .iv{font-size:28px;color:#eee;margin-top:8px;}\
-        .show{display:flex;align-items:center;justify-content:center;height:100%;\
+        .show{display:flex;align-items:center;justify-content:center;height:150px;\
         font-size:48px;font-weight:700;color:#fff;background:#1565c0;}</style></head><body>";
 
     match phase {

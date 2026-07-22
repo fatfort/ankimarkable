@@ -12,6 +12,9 @@ description = "Anki review client for the reMarkable Paper Pro (AppLoad/QTFB app
 # lives inside this crate. rustls (not native OpenSSL) so it cross-compiles to
 # musl cleanly.
 anki = { git = "https://github.com/ankitects/anki", tag = "25.09.4", default-features = false, features = ["rustls"] }
+# Same source anki already resolves — only for the BuryOrSuspendMode enum used by
+# `Collection::bury_or_suspend_cards` (the ⋮ menu's bury/suspend actions).
+anki_proto = { git = "https://github.com/ankitects/anki", tag = "25.09.4" }
 
 # Pure-Rust CPU HTML/CSS rendering stack (blitz + stylo + taffy + parley +
 # vello_cpu). No wgpu/GPU — cross-compiles to musl, runs on the device's A53.

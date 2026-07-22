@@ -117,12 +117,14 @@ impl Whiteboard {
     }
 
     /// Undo the last completed stroke: rebuild ink from the remainder, full refresh.
-    pub fn undo(&mut self, qtfb: &mut Qtfb) {
+    /// Returns `false` when there was no stroke to undo (caller may then undo the card).
+    pub fn undo(&mut self, qtfb: &mut Qtfb) -> bool {
         if self.strokes.pop().is_none() {
-            return;
+            return false;
         }
         self.rebuild_ink();
         self.blit_full(qtfb);
+        true
     }
 
     /// Clear the whiteboard (button): drop ink, restore base, full refresh.

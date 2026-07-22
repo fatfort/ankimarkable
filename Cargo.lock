@@ -233,6 +233,7 @@ name = "ankimarkable"
 version = "0.1.0"
 dependencies = [
  "anki",
+ "anki_proto",
  "anyhow",
  "anyrender",
  "anyrender_vello_cpu",

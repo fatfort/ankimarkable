@@ -127,9 +127,9 @@ fn main() -> anyhow::Result<()> {
 
     match be.next_card()? {
         Some(card) => {
-            let q = ui::compose_review(&r, &card, Phase::Question, counts, "ready", false);
+            let q = ui::compose_review(&r, &card, Phase::Question, counts, "ready", false, false);
             save_png("/home/root/screen_q.png", &q, ui::WIDTH, ui::HEIGHT)?;
-            let a = ui::compose_review(&r, &card, Phase::Answer, counts, "ready", false);
+            let a = ui::compose_review(&r, &card, Phase::Answer, counts, "ready", false, false);
             save_png("/home/root/screen_a.png", &a, ui::WIDTH, ui::HEIGHT)?;
             println!("buttons: {:?}", card.button_labels);
         }

@@ -120,6 +120,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
     // Review state, populated when a deck is picked.
     let mut counts = Counts::default();
     let mut current: Option<backend::ReviewCard> = None;
+    let mut menu_open = false; // ⋮ overflow menu (Bury card / Suspend note)
     let mut phase = Phase::Question;
     let mut status = String::new();
 
@@ -231,7 +232,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         status = d.name.clone();
                         wb.clear_ink();
                         screen = Screen::Review;
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
                     }
                 }
                 HomeHit::Toggle(i) => {
@@ -275,6 +276,12 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     );
                 }
                 HomeHit::Sync => {
+                    ui::draw_message(
+                        &mut qtfb,
+                        &renderer,
+                        "Syncing…",
+                        "Contacting AnkiWeb — this can take a moment.",
+                    );
                     let s = do_sync(&mut backend);
                     all_decks = backend.deck_infos().unwrap_or_default();
                     visible = visible_decks(&all_decks, &collapsed);
@@ -291,6 +298,37 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                 HomeHit::Exit => break,
                 HomeHit::None => {}
             },
+            // While the ⋮ menu is open, taps hit its items (or dismiss it).
+            Screen::Review if menu_open => {
+                let act = ui::hit_menu(ev.x, ev.y);
+                menu_open = false;
+                let advanced = match act {
+                    ui::MenuHit::Bury => {
+                        if let Some(card) = &current {
+                            if let Err(e) = backend.bury_card(card.card_id) {
+                                status = format!("bury error: {e}");
+                            }
+                        }
+                        true
+                    }
+                    ui::MenuHit::Suspend => {
+                        if let Some(card) = &current {
+                            if let Err(e) = backend.suspend_note(card.note_id) {
+                                status = format!("suspend error: {e}");
+                            }
+                        }
+                        true
+                    }
+                    ui::MenuHit::None => false, // tapped outside → just dismiss
+                };
+                if advanced {
+                    counts = backend.counts().unwrap_or_default();
+                    current = backend.next_card().unwrap_or(None);
+                    phase = Phase::Question;
+                    wb.clear_ink();
+                }
+                redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+            }
             Screen::Review => match ui::hit_test(ev.x, ev.y, phase) {
                 Hit::Exit => break,
                 Hit::Home => {
@@ -309,18 +347,24 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     );
                 }
                 Hit::Sync => {
+                    ui::draw_message(
+                        &mut qtfb,
+                        &renderer,
+                        "Syncing…",
+                        "Contacting AnkiWeb — this can take a moment.",
+                    );
                     status = do_sync(&mut backend);
                     counts = backend.counts().unwrap_or_default();
                     current = backend.next_card().unwrap_or(None);
                     phase = Phase::Question;
                     wb.clear_ink();
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
                 }
                 Hit::ShowAnswer => {
                     if current.is_some() && phase == Phase::Question {
                         phase = Phase::Answer;
                         // Keep ink so you can compare your answer against the card.
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
                     }
                 }
                 Hit::Grade(g) => {
@@ -335,15 +379,39 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         current = backend.next_card().unwrap_or(None);
                         phase = Phase::Question;
                         wb.clear_ink(); // next card starts on a clean whiteboard
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
                     }
                 }
-                Hit::Undo => wb.undo(&mut qtfb),
+                Hit::Undo => {
+                    // Undo the last pen stroke; when the whiteboard is empty, fall
+                    // through to undoing the last graded card (Anki collection undo).
+                    if !wb.undo(&mut qtfb) {
+                        match backend.undo() {
+                            Ok(true) => {
+                                session_reviews = session_reviews.saturating_sub(1);
+                                counts = backend.counts().unwrap_or_default();
+                                current = backend.next_card().unwrap_or(None);
+                                phase = Phase::Question;
+                                wb.clear_ink();
+                                redraw(
+                                    &mut qtfb, &renderer, &mut wb, &current, phase, counts,
+                                    &status, menu_open,
+                                );
+                            }
+                            _ => {} // nothing to undo
+                        }
+                    }
+                }
                 Hit::Clear => wb.clear(&mut qtfb),
                 Hit::EraserToggle => {
                     wb.toggle_eraser();
                     // Recompose so the toolbar reflects the toggle; ink is kept.
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
+                }
+                Hit::Menu => {
+                    // Open the ⋮ overflow menu (Bury card / Suspend note).
+                    menu_open = true;
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open);
                 }
                 Hit::None => {}
             },
@@ -364,10 +432,11 @@ fn redraw(
     phase: Phase,
     counts: Counts,
     status: &str,
+    menu_open: bool,
 ) {
     let eraser = wb.eraser;
     let frame = match current {
-        Some(card) => ui::compose_review(renderer, card, phase, counts, status, eraser),
+        Some(card) => ui::compose_review(renderer, card, phase, counts, status, eraser, menu_open),
         None => ui::compose_message(
             renderer,
             "All done",

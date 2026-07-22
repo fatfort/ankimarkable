@@ -6,11 +6,13 @@
 //! Card *rendering to pixels* lives in `render.rs`; this module only produces the
 //! HTML/CSS strings that Anki itself would feed a webview.
 
-use anki::card::CardId;
+use anki::card::{CardId, CardQueueNumber};
 use anki::collection::{Collection, CollectionBuilder};
 use anki::decks::DeckId;
 use anki::scheduler::answering::{CardAnswer, Rating};
 use anki::scheduler::states::SchedulingStates;
+use anki::search::SortMode;
+use anki_proto::scheduler::bury_or_suspend_cards_request::Mode as BuryMode;
 use anki::sync::collection::normal::SyncActionRequired;
 use anki::sync::login::sync_login;
 use anki::sync::media::progress::MediaSyncProgress;
@@ -59,11 +61,23 @@ pub struct Stats {
     pub reviewed_today: u32,
 }
 
+/// Which queue the current card came from — drives the underline under the
+/// matching top-bar count (new = blue, learning/redo = red, review = green).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardKind {
+    New,
+    Learning,
+    Review,
+}
+
 /// A card ready to review: full self-contained HTML for each side plus the
 /// per-grade interval previews ("<1m", "1d", …). `states` is retained so the
 /// chosen grade maps to the exact next CardState the scheduler computed.
 pub struct ReviewCard {
     pub card_id: CardId,
+    /// The card's note id (for the ⋮ menu's "Suspend note" action).
+    pub note_id: i64,
+    pub kind: CardKind,
     pub question_html: String,
     pub answer_html: String,
     /// [again, hard, good, easy]
@@ -201,6 +215,12 @@ impl Backend {
             return Ok(None);
         };
         let cid = qc.card.id();
+        let kind = match qc.card.queue_number() {
+            CardQueueNumber::New => CardKind::New,
+            CardQueueNumber::Learning => CardKind::Learning,
+            // Review or (shouldn't happen for a queued card) Invalid → review.
+            _ => CardKind::Review,
+        };
 
         let out = self.col().render_existing_card(cid, false, false)?;
         let q_html = self.math.preprocess(&nodes_to_html(&out.qnodes));
@@ -218,6 +238,8 @@ impl Backend {
 
         Ok(Some(ReviewCard {
             card_id: cid,
+            note_id: qc.card.note_id().0,
+            kind,
             question_html: question,
             answer_html: answer,
             button_labels,
@@ -232,6 +254,28 @@ impl Backend {
         let q = self.math.preprocess(&nodes_to_html(&out.qnodes));
         let a = self.math.preprocess(&nodes_to_html(&out.anodes));
         Ok((wrap_card(&out.css, &q), wrap_card(&out.css, &a)))
+    }
+
+    /// Undo the last undoable operation (e.g. the previous grade) so the card comes
+    /// back. Returns true if something was undone, false if the undo queue is empty.
+    /// Bury the current card (⋮ menu → "Bury card"): hides it until tomorrow.
+    pub fn bury_card(&mut self, cid: CardId) -> Result<()> {
+        self.col().bury_or_suspend_cards(&[cid], BuryMode::BuryUser)?;
+        Ok(())
+    }
+
+    /// Suspend every card of a note (⋮ menu → "Suspend note"): removes them from
+    /// review until manually unsuspended.
+    pub fn suspend_note(&mut self, note_id: i64) -> Result<()> {
+        let cids = self.col().search_cards(&format!("nid:{note_id}"), SortMode::NoOrder)?;
+        if !cids.is_empty() {
+            self.col().bury_or_suspend_cards(&cids, BuryMode::Suspend)?;
+        }
+        Ok(())
+    }
+
+    pub fn undo(&mut self) -> Result<bool> {
+        Ok(self.col().undo().is_ok())
     }
 
     /// Grade a card — writes the new scheduling state to the collection DB.
@@ -349,7 +393,7 @@ fn wrap_card(css: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
          html,body{{background:#fff;color:#000;margin:0;padding:0;}}\
-         body.card{{font-size:40px;line-height:1.5;}}\
+         body.card{{font-size:40px;line-height:1.75;}}\
          .am-pad{{box-sizing:border-box;padding:64px 88px;max-width:1500px;\
          margin:0 auto;}}\
          .am-pad img{{max-width:100%;height:auto;}}\
@@ -358,7 +402,8 @@ fn wrap_card(css: &str, body: &str) -> String {
          /* am-overrides — win over the notetype CSS */\
          :root{{--font-size-regular:30px!important;--font-size-small:24px!important;\
          --card-max-width:60em!important;--img-width:66%!important;}}\
-         body.card{{font-size:36px!important;line-height:1.5!important;}}\
+         body.card{{font-size:36px!important;line-height:1.75!important;}}\
+         .am-pad,#qa{{line-height:1.75!important;}}\
          .prettify-flashcard{{max-width:none!important;}}\
          .am-pad{{max-width:1520px!important;}}\
          #note-content,#example-content{{display:block!important;}}\
