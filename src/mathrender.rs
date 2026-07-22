@@ -289,7 +289,7 @@ fn finalize_math_png(png: &[u8], inline: bool, baseline: f32) -> Option<(Vec<u8>
     for y in 0..h {
         for x in 0..w {
             // Low threshold so faint anti-aliased edge pixels count → no edge clip.
-            if src[(y * w + x) * 4 + 3] > 6 {
+            if src[(y * w + x) * 4 + 3] > 3 {
                 any = true;
                 minx = minx.min(x);
                 maxx = maxx.max(x);
@@ -301,7 +301,7 @@ fn finalize_math_png(png: &[u8], inline: bool, baseline: f32) -> Option<(Vec<u8>
     if !any {
         return None;
     }
-    let mx = 6usize; // horizontal margin — italic glyph right edges need headroom
+    let mx = 12usize; // horizontal margin — italic glyph right edges need headroom
     let mt = 3usize; // top margin
     let x0 = minx.saturating_sub(mx);
     let x1 = (maxx + mx).min(w - 1);

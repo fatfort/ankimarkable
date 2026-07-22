@@ -211,10 +211,7 @@ pub fn compose_review(
         Phase::Question => &card.question_html,
         Phase::Answer => &card.answer_html,
     };
-    let mut card_buf = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
-    if mono {
-        desaturate(&mut card_buf); // black-and-white card rendering
-    }
+    let card_buf = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
     blit(&mut fb, &card_buf, WIDTH, CARD_H, 0, CARD_Y);
 
     let top_buf = renderer.render_rgba(
@@ -236,6 +233,11 @@ pub fn compose_review(
     draw_menu_button(&mut fb, renderer);
     if menu_open {
         draw_menu_panel(&mut fb, renderer);
+    }
+    // Black-and-white mode: desaturate the WHOLE composed frame (card + chrome) so
+    // the toggle is unmistakable even on an already-monochrome card.
+    if mono {
+        desaturate(&mut fb);
     }
     fb
 }
