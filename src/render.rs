@@ -35,6 +35,12 @@ const F_SANS_BIT: &[u8] = include_bytes!("../assets/fonts/NotoSans-BoldItalic.tt
 const F_MONO: &[u8] = include_bytes!("../assets/fonts/NotoMono-Regular.ttf");
 const F_SYMBOLS: &[u8] = include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf");
 const F_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf");
+// Nerd Font symbols (powerline / devicons / font-awesome, all in the Private Use
+// Area) — cards that use Nerd Font icons would otherwise show tofu boxes.
+const F_NERD: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+// XITS Math — broad math-symbol coverage (arrows like ⇒ U+21D2, operators, greek)
+// that cards use as literal unicode in prose. Without it those show tofu boxes.
+const F_XITS: &[u8] = include_bytes!("../assets/fonts/rex-xits.otf");
 
 pub struct Renderer {
     font_ctx: FontContext,
@@ -134,7 +140,7 @@ fn build_font_ctx() -> FontContext {
         mono_ids.push(fam);
     }
     let mut fallback_ids = Vec::new();
-    for bytes in [F_SYMBOLS, F_EMOJI] {
+    for bytes in [F_SYMBOLS, F_EMOJI, F_NERD, F_XITS] {
         for (fam, _) in fcx
             .collection
             .register_fonts(Blob::from(bytes.to_vec()), None)
@@ -155,7 +161,9 @@ fn build_font_ctx() -> FontContext {
     // fonts, the default (named) fallbacks resolve to nothing, so register our
     // Symbols2 + Emoji on the scripts that carry stray glyphs (emoji, symbols,
     // common punctuation/dingbats, math) plus Latin as a catch-all.
-    for tag in [b"Zsye", b"Zsym", b"Zyyy", b"Zmth", b"Latn"] {
+    // `Zzzz` = Unknown script, which is what Private-Use-Area codepoints (Nerd Font
+    // icons) resolve to; include it so those get the Nerd Font fallback.
+    for tag in [b"Zsye", b"Zsym", b"Zyyy", b"Zmth", b"Latn", b"Zzzz"] {
         fcx.collection
             .append_fallbacks(Script(*tag), fallback_ids.iter().copied());
     }
