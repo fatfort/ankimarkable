@@ -7,13 +7,14 @@ it. Ships as a standalone [AppLoad](https://github.com/asivery/rm-appload) app: 
 xochitl injection, no boot-bank risk.
 
 <p align="center">
-  <img src="docs/review.png" width="46%" alt="Review screen: HMM card with inline math, deck counts with active-queue underline, grade chrome">
-  &nbsp;
-  <img src="docs/whiteboard.png" width="46%" alt="Pen whiteboard: handwritten F-statistic worked answer over the card, black-and-white mode">
+  <img src="docs/side-by-side.png" width="96%" alt="Left: colour-mode review screen — HMM card with inline LaTeX, deck counts with active-queue underline, coloured grade bar. Right: black-and-white mode — a handwritten F-statistic worked on the pen whiteboard over the card, grade bar desaturated.">
 </p>
 
-*Left: a statistics card with inline LaTeX rendered on-device. Right: working the
-answer by hand on the whiteboard (in black-and-white mode) before revealing.*
+*Left: a card with inline LaTeX rendered on-device, in **colour mode** (note the
+coloured grade bar). Right: the same app in **black-and-white mode** — tap the
+deck counts (top-left) to switch; the whole frame desaturates, which many people
+prefer for text-heavy decks on e-ink — with an answer being worked out by hand
+on the pen whiteboard before revealing.*
 
 ## Features
 
@@ -30,9 +31,18 @@ answer by hand on the whiteboard (in black-and-white mode) before revealing.*
   diagrams appear via Anki desktop's own pre-rendered SVGs.
 - **Full card fidelity** — cards render with their own HTML/CSS templates (pure-Rust
   blitz/stylo stack, embedded fonts), including images from your media collection.
+- **Two-finger scroll + pinch-zoom** — long cards pan with a two-finger drag
+  (fast partial refreshes while you move, one clean colour pass when you stop;
+  your ink scrolls with the card). Pinch snaps between 1.0×/1.25×/1.5×/2.0× with
+  a real reflow — text gets bigger *and rewraps to the card width*, so nothing
+  hangs off-screen. One finger on the card still does nothing (palm safety).
 - **Home screen** — collapsible deck tree with due counts, review streak, and
   tap-to-review any deck.
-- **Tap the counts to toggle colour / black-and-white** rendering.
+- **Colour ↔ black-and-white toggle** — tap the deck counts (top-left) to flip
+  the whole frame between full colour and desaturated grayscale. Colour is great
+  for image-heavy decks; B&W renders text crisper on e-ink and avoids the colour
+  panel's slower settle. The mode persists as you review and is unmissable when
+  toggled (the grade bar changes with it — see the screenshots above).
 - **Review chrome** — new/learning/review counts with an underline marking the
   current card's queue; Undo (strokes first, then the last grade); an overflow menu
   for **bury card / suspend note**; colour-e-ink-aware refresh (fast mono inking +
