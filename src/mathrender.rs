@@ -265,12 +265,13 @@ fn img_tag(r: &Rendered, inline: bool) -> String {
     }
 }
 
-/// For INLINE math: distance (fraction of RENDER_PT) the ink's vertical CENTRE sits
-/// above the image bottom. Since parley bottom-pins the image to the text baseline,
-/// this lands every formula's centre a fixed amount above the baseline ≈ the text's
-/// midline (vertical-align:middle), uniformly and WITHOUT clipping (deep-descent
-/// formulas just extend the box down instead of being cut).
-const INLINE_CENTER: f32 = 0.24;
+/// For INLINE math: how far (fraction of RENDER_PT) below the math BASELINE the
+/// image bottom sits. parley bottom-pins the image to the text baseline, so the
+/// math baseline (where the main glyphs H, β, = sit) lands this far ABOVE the text
+/// baseline — small so the main glyphs sit low/natural, keeping typical subscripts
+/// while trimming only the very bottom of deep descenders (β-tails). Uniform across
+/// formulas regardless of height (tall ones don't float up).
+const INLINE_DESCENT: f32 = 0.12;
 
 /// Decode a mathpng PNG (transparent bg, dark grey ink), crop it, force the ink to
 /// PURE BLACK (max e-ink contrast; mathpng renders it ~#222) keeping the anti-alias
@@ -307,15 +308,16 @@ fn finalize_math_png(png: &[u8], inline: bool, baseline: f32) -> Option<(Vec<u8>
     let mt = 3usize; // top margin
     let x0 = minx.saturating_sub(mx);
     let x1 = (maxx + mx).min(w - 1);
-    let _ = baseline; // (middle-alignment uses the ink bbox, not the baseline)
     let y0 = miny.saturating_sub(mt);
     let y1 = if inline {
-        // Put the ink's vertical centre a fixed distance above the image bottom so
-        // parley's baseline bottom-pin centres it on the text midline. Never clip:
-        // if the ink is deeper than that, the box just extends to the ink bottom.
-        let c = (INLINE_CENTER * RENDER_PT) as usize;
-        let ink_center = (miny + maxy) / 2;
-        (ink_center + c).max(maxy + mt).min(y0 + 4000)
+        // Image bottom = math baseline + a small fixed descent → the main glyphs sit
+        // just above the text baseline (low/natural), UNIFORMLY regardless of the
+        // formula's height. Deep descenders below this are trimmed.
+        let d = (INLINE_DESCENT * RENDER_PT) as usize;
+        (baseline.round().max(0.0) as usize)
+            .saturating_add(d)
+            .max(y0 + 1)
+            .min(y0 + 4000)
     } else {
         (maxy + mt).min(h - 1)
     };
