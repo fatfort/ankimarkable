@@ -265,10 +265,12 @@ fn img_tag(r: &Rendered, inline: bool) -> String {
     }
 }
 
-/// Space (fraction of RENDER_PT) kept below the math baseline for INLINE formulas.
-/// Fixed for ALL inline math so every formula aligns identically (parley bottom-pins
-/// the image to the text baseline); big enough to hold typical subscript descenders.
-const INLINE_DESCENT: f32 = 0.16;
+/// For INLINE math: distance (fraction of RENDER_PT) the ink's vertical CENTRE sits
+/// above the image bottom. Since parley bottom-pins the image to the text baseline,
+/// this lands every formula's centre a fixed amount above the baseline ≈ the text's
+/// midline (vertical-align:middle), uniformly and WITHOUT clipping (deep-descent
+/// formulas just extend the box down instead of being cut).
+const INLINE_CENTER: f32 = 0.24;
 
 /// Decode a mathpng PNG (transparent bg, dark grey ink), crop it, force the ink to
 /// PURE BLACK (max e-ink contrast; mathpng renders it ~#222) keeping the anti-alias
@@ -305,15 +307,15 @@ fn finalize_math_png(png: &[u8], inline: bool, baseline: f32) -> Option<(Vec<u8>
     let mt = 3usize; // top margin
     let x0 = minx.saturating_sub(mx);
     let x1 = (maxx + mx).min(w - 1);
+    let _ = baseline; // (middle-alignment uses the ink bbox, not the baseline)
     let y0 = miny.saturating_sub(mt);
     let y1 = if inline {
-        // Uniform bottom = baseline + a fixed descent. May sit past the source image
-        // (transparent padding for descenderless formulas) — that's the point.
-        let desc = (INLINE_DESCENT * RENDER_PT) as usize;
-        (baseline.round().max(0.0) as usize)
-            .saturating_add(desc)
-            .max(y0 + 1)
-            .min(y0 + 4000)
+        // Put the ink's vertical centre a fixed distance above the image bottom so
+        // parley's baseline bottom-pin centres it on the text midline. Never clip:
+        // if the ink is deeper than that, the box just extends to the ink bottom.
+        let c = (INLINE_CENTER * RENDER_PT) as usize;
+        let ink_center = (miny + maxy) / 2;
+        (ink_center + c).max(maxy + mt).min(y0 + 4000)
     } else {
         (maxy + mt).min(h - 1)
     };
