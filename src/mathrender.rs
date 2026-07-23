@@ -58,10 +58,17 @@ pub struct MathRenderer {
 impl MathRenderer {
     pub fn new(media_dir: PathBuf) -> Self {
         let mathpng = PathBuf::from(env_or("AM_MATHPNG", "/home/root/.ankimarkable/bin/mathpng"));
-        let res = env_or(
-            "AM_MATHPNG_RES",
-            "/home/root/xovi/exthome/textBoxes/microtex-res",
-        );
+        // Res-font resolution: env override, else the app's own bundled copy, else
+        // the textBoxes install (dev convenience) — so a standalone install works
+        // without any other product present.
+        let res = std::env::var("AM_MATHPNG_RES").unwrap_or_else(|_| {
+            let own = "/home/root/.ankimarkable/microtex-res";
+            if std::path::Path::new(own).is_dir() {
+                own.to_string()
+            } else {
+                "/home/root/xovi/exthome/textBoxes/microtex-res".to_string()
+            }
+        });
         let cache_dir = PathBuf::from(env_or("AM_MATH_CACHE", "/home/root/.ankimarkable/math-cache"));
         // Only enable the MathJax path if the helper is actually present (it's a
         // device binary; on a Mac spike it's absent → math spans stay raw).
