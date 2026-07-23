@@ -125,11 +125,40 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Scroll/zoom verification (ANKIMARKABLE_SCROLL_CID=<cid>): drive the live
+    // CardView headlessly — paint the answer at several scroll offsets and one
+    // zoom step, so the whole scroll/zoom path is verifiable without touch input.
+    if let Ok(cids) = std::env::var("ANKIMARKABLE_SCROLL_CID") {
+        if let Ok(cid) = cids.parse::<i64>() {
+            let (_q, a) = be.card_html(cid)?;
+            let mut v = r.build_card_view(&a, ui::WIDTH as u32, ui::CARD_H as u32);
+            println!(
+                "scroll test: content_h={:.0} max_scroll={:.0}",
+                v.content_h(),
+                v.max_scroll()
+            );
+            for (i, off) in [0.0f64, 800.0, 1600.0].iter().enumerate() {
+                let cur = v.scroll_phys();
+                v.scroll_by(off - cur);
+                let mut w = v.paint_window();
+                ui::draw_scroll_indicator(&mut w, v.scroll_phys(), v.max_scroll(), v.content_h());
+                save_png(&format!("/home/root/scroll_{i}.png"), &w, ui::WIDTH, ui::CARD_H)?;
+                println!("scroll_{i} at phys {:.0}", v.scroll_phys());
+            }
+            v.set_zoom_step(1);
+            let w = v.paint_window();
+            save_png("/home/root/scroll_zoom.png", &w, ui::WIDTH, ui::CARD_H)?;
+            println!("zoomed → zoom={} content_h={:.0}", v.zoom(), v.content_h());
+        }
+    }
+
     match be.next_card()? {
         Some(card) => {
-            let q = ui::compose_review(&r, &card, Phase::Question, counts, "ready", false, false, false);
+            let qwin = r.render_rgba(&card.question_html, ui::WIDTH as u32, ui::CARD_H as u32);
+            let q = ui::compose_review(&r, &qwin, &card, Phase::Question, counts, "ready", false, false, false);
             save_png("/home/root/screen_q.png", &q, ui::WIDTH, ui::HEIGHT)?;
-            let a = ui::compose_review(&r, &card, Phase::Answer, counts, "ready", false, false, false);
+            let awin = r.render_rgba(&card.answer_html, ui::WIDTH as u32, ui::CARD_H as u32);
+            let a = ui::compose_review(&r, &awin, &card, Phase::Answer, counts, "ready", false, false, false);
             save_png("/home/root/screen_a.png", &a, ui::WIDTH, ui::HEIGHT)?;
             println!("buttons: {:?}", card.button_labels);
         }

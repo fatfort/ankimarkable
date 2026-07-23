@@ -193,10 +193,24 @@ pub fn hit_test(x: i32, y: i32, phase: Phase) -> Hit {
     Hit::None
 }
 
+/// Is (x,y) inside the scrollable card region? Excludes chrome AND the floating
+/// ⋮ button (which must stay tappable — gesture routing consumes card-region
+/// touches before hit_test runs).
+pub fn in_card_region(x: i32, y: i32) -> bool {
+    if x < 0 || (x as usize) >= WIDTH || y < CARD_Y as i32 || (y as usize) >= HEIGHT - BOTTOM_H {
+        return false;
+    }
+    let (mx0, my0, mx1, my1) = menu_btn_rect();
+    let (xu, yu) = (x as usize, y as usize);
+    !(xu >= mx0 && xu < mx1 && yu >= my0 && yu < my1)
+}
+
 /// Composite a full review frame into a fresh WIDTH×HEIGHT RGBA buffer (white bg).
-/// Shared by the on-device path (`draw_review`) and the headless screen test.
+/// `card_window` is the pre-painted card region (WIDTH×CARD_H RGBA) from the live
+/// `CardView` — the caller owns scroll/zoom state, we just composite.
 pub fn compose_review(
     renderer: &Renderer,
+    card_window: &[u8],
     card: &ReviewCard,
     phase: Phase,
     counts: Counts,
@@ -207,12 +221,7 @@ pub fn compose_review(
 ) -> Vec<u8> {
     let mut fb = vec![255u8; WIDTH * HEIGHT * 4];
 
-    let html = match phase {
-        Phase::Question => &card.question_html,
-        Phase::Answer => &card.answer_html,
-    };
-    let card_buf = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
-    blit(&mut fb, &card_buf, WIDTH, CARD_H, 0, CARD_Y);
+    blit(&mut fb, card_window, WIDTH, CARD_H, 0, CARD_Y);
 
     let top_buf = renderer.render_rgba(
         &top_bar_html(counts, Some(card.kind), status, eraser),
@@ -240,6 +249,55 @@ pub fn compose_review(
         desaturate(&mut fb);
     }
     fb
+}
+
+/// Patch ONLY the card band of an existing composed frame (`wb.base`) with a
+/// freshly painted card window — used by scroll/zoom steps so the chrome isn't
+/// re-rendered per step. Re-draws the ⋮ button (it floats over the card) and
+/// re-applies black-and-white mode to the band.
+pub fn patch_card_band(
+    fb: &mut [u8],
+    card_window: &[u8],
+    renderer: &Renderer,
+    menu_open: bool,
+    mono: bool,
+) {
+    // Reset the band to white, then alpha-composite the window (matches the
+    // full-compose path, which blits over a white frame).
+    let band = &mut fb[CARD_Y * WIDTH * 4..(CARD_Y + CARD_H) * WIDTH * 4];
+    for px in band.chunks_exact_mut(4) {
+        px.copy_from_slice(&[255, 255, 255, 255]);
+    }
+    blit(fb, card_window, WIDTH, CARD_H, 0, CARD_Y);
+    draw_menu_button(fb, renderer);
+    if menu_open {
+        draw_menu_panel(fb, renderer);
+    }
+    if mono {
+        desaturate(&mut fb[CARD_Y * WIDTH * 4..(CARD_Y + CARD_H) * WIDTH * 4]);
+    }
+}
+
+/// Draw a thin scroll-position indicator along the card window's right edge
+/// (drawn into the WIDTH×CARD_H window buffer itself, before compositing).
+pub fn draw_scroll_indicator(window: &mut [u8], scroll: f64, max_scroll: f64, content_h: f64) {
+    if max_scroll <= 0.0 || content_h <= 0.0 {
+        return;
+    }
+    let track_h = CARD_H as f64;
+    let thumb_h = ((track_h / content_h) * track_h).max(60.0);
+    let thumb_y = (scroll / max_scroll) * (track_h - thumb_h);
+    let (y0, y1) = (thumb_y as usize, (thumb_y + thumb_h) as usize);
+    let (x0, x1) = (WIDTH - 8, WIDTH - 2);
+    for y in y0..y1.min(CARD_H) {
+        for x in x0..x1 {
+            let i = (y * WIDTH + x) * 4;
+            window[i] = 60;
+            window[i + 1] = 60;
+            window[i + 2] = 60;
+            window[i + 3] = 255;
+        }
+    }
 }
 
 /// Desaturate an RGBA buffer in place (luminance grey) for black-and-white mode.
@@ -289,7 +347,8 @@ fn draw_menu_panel(fb: &mut [u8], renderer: &Renderer) {
     blit(fb, &buf, w, h, x0, y0);
 }
 
-/// Composite + push a full review frame.
+/// Composite + push a full review frame (renders the card window itself at
+/// scroll 0 / zoom 1 — the app's live path goes through `main::redraw` instead).
 pub fn draw_review(
     qtfb: &mut Qtfb,
     renderer: &Renderer,
@@ -299,7 +358,12 @@ pub fn draw_review(
     status: &str,
     eraser: bool,
 ) {
-    let fb = compose_review(renderer, card, phase, counts, status, eraser, false, false);
+    let html = match phase {
+        Phase::Question => &card.question_html,
+        Phase::Answer => &card.answer_html,
+    };
+    let window = renderer.render_rgba(html, WIDTH as u32, CARD_H as u32);
+    let fb = compose_review(renderer, &window, card, phase, counts, status, eraser, false, false);
     qtfb.blit_rgba(&fb, WIDTH, HEIGHT, 0, 0);
     let _ = qtfb.set_refresh_mode(REFRESH_MODE_CONTENT);
     let _ = qtfb.update_full();

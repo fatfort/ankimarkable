@@ -13,9 +13,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use ankimarkable::backend::{self, Backend, Counts, DeckInfo, Stats};
+use ankimarkable::gesture::{CardGesture, CardTouch};
 use ankimarkable::pen::Pen;
-use ankimarkable::qtfb::{Qtfb, INPUT_TOUCH_PRESS};
-use ankimarkable::render::Renderer;
+use ankimarkable::qtfb::{
+    Qtfb, INPUT_TOUCH_PRESS, INPUT_TOUCH_RELEASE, INPUT_TOUCH_UPDATE, REFRESH_MODE_CONTENT,
+};
+use ankimarkable::render::{CardView, Renderer};
 use ankimarkable::ui::{self, Hit, HomeHit, Phase};
 use ankimarkable::whiteboard::Whiteboard;
 
@@ -122,6 +125,11 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
     let mut current: Option<backend::ReviewCard> = None;
     let mut menu_open = false; // ⋮ overflow menu (Bury card / Suspend note)
     let mut mono = false; // false = colour card rendering, true = black-and-white
+    // Live scrollable/zoomable card document (None until a card is shown).
+    let mut view: Option<CardView> = None;
+    // Two-finger scroll/pinch recognition over the QTFB touch stream.
+    let mut touch = CardTouch::new();
+    let mut last_gesture: Option<Instant> = None;
     let mut phase = Phase::Question;
     let mut status = String::new();
 
@@ -133,7 +141,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
         home_stats(base_stats, session_reviews),
     );
 
-    while RUNNING.load(Ordering::SeqCst) {
+    'main: while RUNNING.load(Ordering::SeqCst) {
         // Flush any pending ink FIRST (non-blocking; keeps the dirty region if the
         // e-ink server is still busy). Retrying at the loop top means a deferred
         // update lands promptly without ever blocking the loop. Once writing has
@@ -146,7 +154,10 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
         // pauses in a sentence into a single settle.
         if screen == Screen::Review {
             wb.flush_ink(&mut qtfb);
-            if wb.needs_settle() && last_pen.map_or(true, |t| t.elapsed() >= SETTLE_IDLE) {
+            let pen_quiet = last_pen.map_or(true, |t| t.elapsed() >= SETTLE_IDLE);
+            let gesture_quiet =
+                last_gesture.map_or(true, |t| t.elapsed() >= Duration::from_millis(500));
+            if wb.needs_settle() && pen_quiet && gesture_quiet && !touch.multi_active() {
                 wb.settle_color(&mut qtfb);
             }
         }
@@ -187,7 +198,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
             let mut inked = false;
             let r = pen.as_mut().unwrap().drain(|s| {
                 inked = true;
-                if reviewing {
+                if reviewing && !touch.multi_active() {
                     wb.ink_sample(s, &mut qtfb);
                 }
             });
@@ -208,21 +219,116 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
         if fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
             continue;
         }
-        let ev = match qtfb.recv_input_nonblock() {
-            Ok(Some(ev)) => ev,
-            Ok(None) => continue,
-            Err(_) => break, // socket closed
-        };
-        if ev.input_type != INPUT_TOUCH_PRESS {
-            continue;
-        }
-        // Palm rejection: ignore finger/palm touches within PALM_WINDOW of the last
-        // pen activity (auto-expires, so a missed pen-up can never lock out buttons).
-        if reviewing && last_pen.map_or(false, |t| t.elapsed() < PALM_WINDOW) {
-            continue;
-        }
+        // Drain EVERY queued touch event this wake (motion arrives as repeated
+        // PRESS with the same dev_id on this panel — one-event-per-poll would lag).
+        'input: loop {
+            let ev = match qtfb.recv_input_nonblock() {
+                Ok(Some(ev)) => ev,
+                Ok(None) => break 'input,
+                Err(_) => break 'main, // socket closed
+            };
+            let ty = ev.input_type;
+            let is_touch = ty == INPUT_TOUCH_PRESS
+                || ty == INPUT_TOUCH_RELEASE
+                || ty == INPUT_TOUCH_UPDATE;
+            if !is_touch {
+                continue 'input;
+            }
+            // Palm rejection: ignore finger/palm touches within PALM_WINDOW of the
+            // last pen activity, and while a stroke is actually in progress.
+            if reviewing
+                && (last_pen.map_or(false, |t| t.elapsed() < PALM_WINDOW) || wb.is_inking())
+            {
+                continue 'input;
+            }
 
-        match screen {
+            // ── Review-screen gesture routing (menu-open taps skip to hit_menu) ──
+            if reviewing && !menu_open {
+                let in_card = ui::in_card_region(ev.x, ev.y);
+                if in_card || touch.is_tracked(ev.dev_id) || touch.multi_active() {
+                    let fed = touch.feed(ty, ev.dev_id, ev.x, ev.y, in_card);
+                    match fed.gesture {
+                        CardGesture::ScrollStep(dy) => {
+                            if let Some(v) = view.as_mut() {
+                                if v.scroll_by(dy as f64) {
+                                    let mut window = v.paint_window();
+                                    ui::draw_scroll_indicator(
+                                        &mut window,
+                                        v.scroll_phys(),
+                                        v.max_scroll(),
+                                        v.content_h(),
+                                    );
+                                    ui::patch_card_band(
+                                        wb.base_mut(),
+                                        &window,
+                                        &renderer,
+                                        menu_open,
+                                        mono,
+                                    );
+                                    if v.zoom() == 1.0 {
+                                        wb.set_scroll(v.scroll_phys() as i32);
+                                    }
+                                    wb.blit_band_fast(&mut qtfb);
+                                    last_gesture = Some(Instant::now());
+                                }
+                            }
+                        }
+                        CardGesture::PinchEnd { ratio } => {
+                            let dir = if ratio >= 1.15 {
+                                1
+                            } else if ratio <= 0.87 {
+                                -1
+                            } else {
+                                0
+                            };
+                            if dir != 0 {
+                                if let Some(v) = view.as_mut() {
+                                    if v.set_zoom_step(dir) {
+                                        wb.set_zoom_hidden(v.zoom() != 1.0);
+                                        if v.zoom() == 1.0 {
+                                            wb.set_scroll(v.scroll_phys() as i32);
+                                        }
+                                        let mut window = v.paint_window();
+                                        ui::draw_scroll_indicator(
+                                            &mut window,
+                                            v.scroll_phys(),
+                                            v.max_scroll(),
+                                            v.content_h(),
+                                        );
+                                        ui::patch_card_band(
+                                            wb.base_mut(),
+                                            &window,
+                                            &renderer,
+                                            menu_open,
+                                            mono,
+                                        );
+                                        // Fast feedback now; the queued colour settle
+                                        // makes it crisp ~500ms after the gesture.
+                                        wb.blit_band_fast(&mut qtfb);
+                                        last_gesture = Some(Instant::now());
+                                    }
+                                }
+                            }
+                        }
+                        CardGesture::None => {}
+                    }
+                    if touch.multi_active() {
+                        last_gesture = Some(Instant::now());
+                    }
+                    continue 'input; // card-region touches NEVER hit-test (palm safety)
+                }
+                // Chrome buttons: feed for dev_id dedup; act once per physical press
+                // (motion re-PRESSes of a held finger must not re-fire buttons).
+                let fed = touch.feed(ty, ev.dev_id, ev.x, ev.y, false);
+                if ty != INPUT_TOUCH_PRESS || !fed.new_contact {
+                    continue 'input;
+                }
+            } else if ty != INPUT_TOUCH_PRESS {
+                // Home screen + open-menu handling act on plain presses only.
+                continue 'input;
+            }
+
+            match screen {
             Screen::Home => match ui::hit_test_home(ev.x, ev.y, &visible, scroll) {
                 HomeHit::Deck(i) => {
                     if let Some(d) = visible.get(i) {
@@ -232,8 +338,9 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         phase = Phase::Question;
                         status = d.name.clone();
                         wb.clear_ink();
+                        invalidate_view(&mut view, &mut wb);
                         screen = Screen::Review;
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
                     }
                 }
                 HomeHit::Toggle(i) => {
@@ -296,7 +403,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         home_stats(base_stats, session_reviews),
                     );
                 }
-                HomeHit::Exit => break,
+                HomeHit::Exit => break 'main,
                 HomeHit::None => {}
             },
             // While the ⋮ menu is open, taps hit its items (or dismiss it).
@@ -327,13 +434,16 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     current = backend.next_card().unwrap_or(None);
                     phase = Phase::Question;
                     wb.clear_ink();
+                    invalidate_view(&mut view, &mut wb);
                 }
-                redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
             }
             Screen::Review => match ui::hit_test(ev.x, ev.y, phase) {
-                Hit::Exit => break,
+                Hit::Exit => break 'main,
                 Hit::Home => {
                     // Back to the deck list; rebuild deck counts (streak is cached).
+                    invalidate_view(&mut view, &mut wb);
+                    touch = CardTouch::new();
                     screen = Screen::Home;
                     all_decks = backend.deck_infos().unwrap_or_default();
                     visible = visible_decks(&all_decks, &collapsed);
@@ -359,13 +469,15 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     current = backend.next_card().unwrap_or(None);
                     phase = Phase::Question;
                     wb.clear_ink();
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                    invalidate_view(&mut view, &mut wb);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
                 }
                 Hit::ShowAnswer => {
                     if current.is_some() && phase == Phase::Question {
                         phase = Phase::Answer;
+                        invalidate_view(&mut view, &mut wb);
                         // Keep ink so you can compare your answer against the card.
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
                     }
                 }
                 Hit::Grade(g) => {
@@ -380,7 +492,8 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         current = backend.next_card().unwrap_or(None);
                         phase = Phase::Question;
                         wb.clear_ink(); // next card starts on a clean whiteboard
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                        invalidate_view(&mut view, &mut wb);
+                        redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
                     }
                 }
                 Hit::Undo => {
@@ -394,9 +507,10 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                                 current = backend.next_card().unwrap_or(None);
                                 phase = Phase::Question;
                                 wb.clear_ink();
+                                invalidate_view(&mut view, &mut wb);
                                 redraw(
-                                    &mut qtfb, &renderer, &mut wb, &current, phase, counts,
-                                    &status, menu_open, mono,
+                                    &mut qtfb, &renderer, &mut wb, &current, &mut view, phase,
+                                    counts, &status, menu_open, mono,
                                 );
                             }
                             _ => {} // nothing to undo
@@ -407,21 +521,22 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                 Hit::EraserToggle => {
                     wb.toggle_eraser();
                     // Recompose so the toolbar reflects the toggle; ink is kept.
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
                 }
                 Hit::Menu => {
                     // Open the ⋮ overflow menu (Bury card / Suspend note).
                     menu_open = true;
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
                 }
                 Hit::ColorToggle => {
                     // Tap the counts (top-left) to flip colour / black-and-white.
                     mono = !mono;
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, phase, counts, &status, menu_open, mono);
+                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu_open, mono);
                 }
                 Hit::None => {}
             },
-        }
+            }
+        } // 'input drain
     }
 
     // Drop(Qtfb) sends MESSAGE_TERMINATE.
@@ -430,11 +545,17 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
 
 /// Compose the current screen into the whiteboard's base frame and push it (base +
 /// any ink) to the panel with a clean full refresh.
+///
+/// `view` is the live scrollable/zoomable card document — built here on demand
+/// (when a card/phase change invalidated it to `None`) and painted at its current
+/// scroll/zoom. Callers that change WHICH html is shown must set `*view = None`
+/// (see `invalidate_view`) so the document rebuilds.
 fn redraw(
     qtfb: &mut Qtfb,
     renderer: &Renderer,
     wb: &mut Whiteboard,
     current: &Option<backend::ReviewCard>,
+    view: &mut Option<CardView>,
     phase: Phase,
     counts: Counts,
     status: &str,
@@ -444,7 +565,20 @@ fn redraw(
     let eraser = wb.eraser;
     let frame = match current {
         Some(card) => {
-            ui::compose_review(renderer, card, phase, counts, status, eraser, menu_open, mono)
+            let html = match phase {
+                Phase::Question => &card.question_html,
+                Phase::Answer => &card.answer_html,
+            };
+            if view.is_none() {
+                *view =
+                    Some(renderer.build_card_view(html, ui::WIDTH as u32, ui::CARD_H as u32));
+            }
+            let v = view.as_ref().unwrap();
+            let mut window = v.paint_window();
+            ui::draw_scroll_indicator(&mut window, v.scroll_phys(), v.max_scroll(), v.content_h());
+            ui::compose_review(
+                renderer, &window, card, phase, counts, status, eraser, menu_open, mono,
+            )
         }
         // Keep the top menu bar so Home / Sync / Exit still work (an empty deck or
         // a finished one must not strand you on a chrome-less screen).
@@ -458,6 +592,14 @@ fn redraw(
     };
     wb.set_base(frame);
     wb.blit_full(qtfb);
+}
+
+/// The shown card html is changing (new card / phase flip / leaving review):
+/// drop the live view and reset the whiteboard's scroll/zoom anchoring.
+fn invalidate_view(view: &mut Option<CardView>, wb: &mut Whiteboard) {
+    *view = None;
+    wb.set_scroll(0);
+    wb.set_zoom_hidden(false);
 }
 
 /// Filter the full deck tree to the rows visible given the runtime collapse state:

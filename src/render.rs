@@ -67,9 +67,8 @@ impl Renderer {
         self
     }
 
-    /// Render `html` to a tightly-packed RGBA8888 buffer of `width * height * 4`
-    /// bytes (row-major). Background comes from the HTML body's CSS.
-    pub fn render_rgba(&self, html: &str, width: u32, height: u32) -> Vec<u8> {
+    /// Build a laid-out document at `width`×`height` with media resolved.
+    fn build_document(&self, html: &str, width: u32, height: u32) -> HtmlDocument {
         let viewport = Viewport::new(width, height, 1.0, ColorScheme::Light);
         let mut doc_config = DocumentConfig {
             viewport: Some(viewport),
@@ -108,11 +107,121 @@ impl Renderer {
                 document.resolve(0.0);
             }
         }
+        document
+    }
 
+    /// Render `html` to a tightly-packed RGBA8888 buffer of `width * height * 4`
+    /// bytes (row-major). Background comes from the HTML body's CSS.
+    pub fn render_rgba(&self, html: &str, width: u32, height: u32) -> Vec<u8> {
+        let document = self.build_document(html, width, height);
         render_to_buffer::<VelloCpuImageRenderer, _>(
             |scene| paint_scene(scene, document.as_ref(), 1.0, width, height),
             width,
             height,
+        )
+    }
+
+    /// Build a LIVE card view for the scrollable/zoomable card region: the document
+    /// stays resident so scrolling is a repaint (no re-layout) and zoom is a real
+    /// reflow (text re-wraps to the card width at the new scale).
+    pub fn build_card_view(&self, html: &str, width: u32, height: u32) -> CardView {
+        let doc = self.build_document(html, width, height);
+        let mut view = CardView {
+            doc,
+            width,
+            height,
+            zoom_idx: 0,
+        };
+        view.refresh_content_size();
+        view
+    }
+}
+
+/// Stepped zoom levels — e-ink can't animate a continuous pinch, so a completed
+/// pinch snaps one step in/out and re-renders crisp.
+pub const ZOOM_STEPS: [f32; 4] = [1.0, 1.25, 1.5, 2.0];
+
+/// A live, scrollable, zoomable render of one card side.
+///
+/// Scroll offset lives INSIDE the blitz document (`viewport_scroll`, CSS px);
+/// painting translates by it, so a scroll step needs no re-layout. Zoom uses the
+/// viewport's real zoom factor → full reflow at the new scale.
+pub struct CardView {
+    doc: HtmlDocument,
+    width: u32,
+    height: u32,
+    zoom_idx: usize,
+}
+
+impl CardView {
+    pub fn zoom(&self) -> f32 {
+        ZOOM_STEPS[self.zoom_idx]
+    }
+
+    /// Content height in PHYSICAL px at the current zoom.
+    pub fn content_h(&self) -> f64 {
+        let scale = self.doc.viewport().scale() as f64;
+        let css_h = self.doc.root_element().final_layout.size.height as f64;
+        css_h * scale
+    }
+
+    /// Current scroll offset in PHYSICAL px.
+    pub fn scroll_phys(&self) -> f64 {
+        let scale = self.doc.viewport().scale() as f64;
+        self.doc.viewport_scroll().y * scale
+    }
+
+    /// Maximum scroll offset in physical px (0 when the card fits the window).
+    pub fn max_scroll(&self) -> f64 {
+        (self.content_h() - self.height as f64).max(0.0)
+    }
+
+    fn refresh_content_size(&mut self) {
+        // Nothing cached currently — content_h reads the live layout — but keep the
+        // hook so a future cached-tall-buffer optimization has one place to land.
+    }
+
+    /// Scroll by `dy` physical px (positive = further down the card). Returns true
+    /// if the offset actually changed (clamped at the ends).
+    pub fn scroll_by(&mut self, dy: f64) -> bool {
+        let scale = self.doc.viewport().scale() as f64;
+        // scroll_viewport_by computes `new = current - y` and clamps to content.
+        self.doc.scroll_viewport_by_has_changed(0.0, -(dy / scale))
+    }
+
+    /// Step zoom in (`+1`) or out (`-1`), preserving the reading position as a
+    /// fraction of content height. Returns true if the zoom level changed.
+    pub fn set_zoom_step(&mut self, dir: i32) -> bool {
+        let new_idx = (self.zoom_idx as i32 + dir).clamp(0, ZOOM_STEPS.len() as i32 - 1) as usize;
+        if new_idx == self.zoom_idx {
+            return false;
+        }
+        let frac = if self.content_h() > 0.0 {
+            self.scroll_phys() / self.content_h()
+        } else {
+            0.0
+        };
+        self.zoom_idx = new_idx;
+        let mut vp = Viewport::new(self.width, self.height, 1.0, ColorScheme::Light);
+        vp.set_zoom(ZOOM_STEPS[new_idx]);
+        self.doc.set_viewport(vp);
+        self.doc.resolve(0.0);
+        // Re-anchor: scroll to the same content fraction at the new size, using the
+        // clamped scroll_viewport_by (zero it, then move down by the target).
+        let scale = self.doc.viewport().scale() as f64;
+        let target_css = (frac * self.content_h()) / scale;
+        self.doc.scroll_viewport_by(0.0, 1.0e9); // clamp to top
+        self.doc.scroll_viewport_by(0.0, -target_css); // clamped downward move
+        true
+    }
+
+    /// Paint the current window (width×height at the current scroll/zoom) to RGBA.
+    pub fn paint_window(&self) -> Vec<u8> {
+        let scale = self.doc.viewport().scale() as f64;
+        render_to_buffer::<VelloCpuImageRenderer, _>(
+            |scene| paint_scene(scene, self.doc.as_ref(), scale, self.width, self.height),
+            self.width,
+            self.height,
         )
     }
 }

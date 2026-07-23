@@ -15,7 +15,7 @@
 //! over the top/bottom chrome are ignored so writing never spills onto the bars.
 
 use crate::pen::PenSample;
-use crate::qtfb::{Qtfb, REFRESH_MODE_ANIMATE, REFRESH_MODE_CONTENT};
+use crate::qtfb::{Qtfb, REFRESH_MODE_ANIMATE, REFRESH_MODE_CONTENT, REFRESH_MODE_FAST};
 use crate::ui::{CARD_H, CARD_Y, HEIGHT, WIDTH};
 
 /// Eraser brush radius (px) — much larger than a pen stroke so the eraser end
@@ -24,7 +24,10 @@ const ERASE_RADIUS: i32 = 26;
 
 struct Stroke {
     erase: bool,
-    pts: Vec<(i32, i32, u8)>, // x, y, width
+    // x (panel), y in CARD-CONTENT coords (panel y − CARD_Y + scroll at capture) —
+    // so ink scrolls WITH the card: rebuild_ink maps back through the current
+    // scroll offset.
+    pts: Vec<(i32, i32, u8)>,
 }
 
 pub struct Whiteboard {
@@ -33,6 +36,11 @@ pub struct Whiteboard {
     strokes: Vec<Stroke>,
     active: Option<Stroke>,
     last: Option<(i32, i32)>,
+    /// Card scroll offset (physical px) the ink is currently rebuilt for.
+    scroll_y: i32,
+    /// True while the card is zoomed (zoom ≠ 1.0): ink is hidden and new ink
+    /// refused — strokes are anchored at 1.0 scale and would misalign.
+    zoom_hidden: bool,
     // Accumulated dirty rect (x0,y0,x1,y1) pending a coalesced refresh — samples
     // ink into the framebuffer but the e-ink refresh is batched (one per input
     // drain, not one per sample), which is what keeps inking smooth.
@@ -57,6 +65,8 @@ impl Whiteboard {
             strokes: Vec::new(),
             active: None,
             last: None,
+            scroll_y: 0,
+            zoom_hidden: false,
             dirty: None,
             settle: None,
             eraser: false,
@@ -71,6 +81,33 @@ impl Whiteboard {
     pub fn set_base(&mut self, frame: Vec<u8>) {
         debug_assert_eq!(frame.len(), self.base.len());
         self.base = frame;
+    }
+
+    /// Mutable access to the base frame so scroll steps can patch just the card
+    /// band without a full recompose (see `ui::patch_card_band`).
+    pub fn base_mut(&mut self) -> &mut [u8] {
+        &mut self.base
+    }
+
+    /// The card scrolled: re-anchor the ink to the new offset (strokes are stored
+    /// in card-content coords, so this is a translate + replay).
+    pub fn set_scroll(&mut self, scroll_y: i32) {
+        if scroll_y != self.scroll_y {
+            self.scroll_y = scroll_y;
+            // A stroke can't sanely continue across a scroll step.
+            if let Some(st) = self.active.take() {
+                if !st.pts.is_empty() {
+                    self.strokes.push(st);
+                }
+            }
+            self.last = None;
+            self.rebuild_ink();
+        }
+    }
+
+    /// Hide ink + refuse new strokes while the card is zoomed (≠ 1.0).
+    pub fn set_zoom_hidden(&mut self, hidden: bool) {
+        self.zoom_hidden = hidden;
     }
 
     /// Drop all ink + strokes (used when advancing to the next card).
@@ -96,7 +133,7 @@ impl Whiteboard {
         for idx in 0..(WIDTH * HEIGHT) {
             let bi = idx * 4;
             let di = idx * 3;
-            let cov = self.ink[idx] as u32;
+            let cov = if self.zoom_hidden { 0 } else { self.ink[idx] as u32 };
             if cov == 0 {
                 shm[di] = self.base[bi];
                 shm[di + 1] = self.base[bi + 1];
@@ -114,6 +151,34 @@ impl Whiteboard {
         // accumulated fast-waveform artifacts (ghosts / "empty white rectangles").
         self.dirty = None;
         self.settle = None;
+    }
+
+    /// Push ONLY the card band (base + ink) with a fast DU partial refresh — the
+    /// scroll-step hot path. Non-blocking: if the e-ink server is behind, the frame
+    /// is in shm and the next step (or the colour settle) will show it. DU (not A2)
+    /// because the band is card CONTENT — grayscale/images — not just ink.
+    pub fn blit_band_fast(&mut self, qtfb: &mut Qtfb) {
+        let shm: &mut [u8] = &mut *qtfb.shm;
+        for idx in (CARD_Y * WIDTH)..((CARD_Y + CARD_H) * WIDTH) {
+            let bi = idx * 4;
+            let di = idx * 3;
+            let cov = if self.zoom_hidden { 0 } else { self.ink[idx] as u32 };
+            if cov == 0 {
+                shm[di] = self.base[bi];
+                shm[di + 1] = self.base[bi + 1];
+                shm[di + 2] = self.base[bi + 2];
+            } else {
+                let ia = 255 - cov;
+                for k in 0..3 {
+                    shm[di + k] = ((self.base[bi + k] as u32 * ia) / 255) as u8;
+                }
+            }
+        }
+        let _ = qtfb.try_set_refresh_mode(REFRESH_MODE_FAST);
+        let _ = qtfb.try_update_partial(0, CARD_Y as i32, WIDTH as i32, CARD_H as i32);
+        // The DU pass dropped colour over the whole band — queue a colour settle.
+        self.settle = Some((0, CARD_Y as i32, (WIDTH - 1) as i32, (CARD_Y + CARD_H - 1) as i32));
+        self.dirty = None; // superseded: the whole band was just pushed
     }
 
     /// Undo the last completed stroke: rebuild ink from the remainder, full refresh.
@@ -138,11 +203,15 @@ impl Whiteboard {
             *b = 0;
         }
         let strokes = std::mem::take(&mut self.strokes);
+        let off = CARD_Y as i32 - self.scroll_y; // content y → panel y
         for st in &strokes {
             let mut prev: Option<(i32, i32)> = None;
-            for &(x, y, w) in &st.pts {
+            for &(x, cy, w) in &st.pts {
+                let y = cy + off;
                 let r = ((w as i32) / 2).max(1);
                 let (fx, fy) = prev.unwrap_or((x, y));
+                // segment_ink clips to the card band per-stamp, so segments that
+                // scrolled off-window vanish cleanly.
                 segment_ink(&mut self.ink, fx, fy, x, y, r, st.erase);
                 prev = Some((x, y));
             }
@@ -155,6 +224,10 @@ impl Whiteboard {
     /// refresh) is what makes inking smooth: a QTFB partial-refresh per sample can't
     /// keep up with the pen's sample rate and reads as laggy/jittery.
     pub fn ink_sample(&mut self, s: PenSample, qtfb: &mut Qtfb) {
+        // Zoomed card: ink is hidden and anchored at 1.0 scale — refuse new ink.
+        if self.zoom_hidden {
+            return;
+        }
         if s.up {
             if let Some(st) = self.active.take() {
                 if !st.pts.is_empty() {
@@ -219,10 +292,14 @@ impl Whiteboard {
             }
         }
 
-        // 3. record the point (draw strokes only) + grow the pending dirty rect.
-        if !erasing {
+        // 3. record the point in CARD-CONTENT coords (so ink scrolls with the card).
+        // Erase strokes record too — with the effective eraser width — so both
+        // scroll rebuilds and undo replay them faithfully.
+        {
+            let cy = y - CARD_Y as i32 + self.scroll_y;
+            let wrec = if erasing { (ERASE_RADIUS * 2) as u8 } else { s.w };
             if let Some(st) = self.active.as_mut() {
-                st.pts.push((x, y, s.w));
+                st.pts.push((x, cy, wrec));
             }
         }
         self.last = Some((x, y));
