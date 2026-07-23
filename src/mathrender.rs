@@ -158,7 +158,11 @@ impl MathRenderer {
             for (tex, inline) in spans {
                 let key = tex_key(tex, *inline);
                 let clean = tex.replace(['\t', '\n', '\r'], " ");
-                let _ = writeln!(stdin, "{key:016x}\t{RENDER_PT}\t{clean}");
+                // Inline math in TEXT style so fractions/operators stay compact and
+                // fit the line (MathJax does the same for \(...\)); display math in
+                // DISPLAY style (full-size) for \[...\].
+                let style = if *inline { "\\textstyle" } else { "\\displaystyle" };
+                let _ = writeln!(stdin, "{key:016x}\t{RENDER_PT}\t{style} {clean}");
             }
             // stdin dropped here -> EOF -> mathpng flushes + exits.
         }
@@ -250,15 +254,17 @@ fn img_tag(r: &Rendered, inline: bool) -> String {
     let w = r.w * DISPLAY_SCALE;
     let h = r.h * DISPLAY_SCALE;
     if inline {
+        // Small horizontal margin so the formula doesn't butt against adjacent words.
         format!(
-            "<img class=\"am-math\" style=\"width:{w:.1}px;height:{h:.1}px;\" src=\"{uri}\">",
+            "<img class=\"am-math\" style=\"width:{w:.1}px;height:{h:.1}px;margin:0 0.12em;\" src=\"{uri}\">",
             uri = r.uri
         )
     } else {
-        // Block, centred, natural size. max-width keeps a very wide equation from
-        // overflowing (height:auto preserves aspect if it has to shrink).
+        // Block, centred, natural size, with generous vertical breathing room.
+        // max-width keeps a very wide equation from overflowing (height:auto
+        // preserves aspect if it has to shrink).
         format!(
-            "<img class=\"am-math\" style=\"display:block;margin:16px auto;\
+            "<img class=\"am-math\" style=\"display:block;margin:26px auto;\
              width:{w:.1}px;max-width:100%;height:auto;\" src=\"{uri}\">",
             uri = r.uri
         )
@@ -310,13 +316,15 @@ fn finalize_math_png(png: &[u8], inline: bool, baseline: f32) -> Option<(Vec<u8>
     let x1 = (maxx + mx).min(w - 1);
     let y0 = miny.saturating_sub(mt);
     let y1 = if inline {
-        // Image bottom = math baseline + a small fixed descent → the main glyphs sit
-        // just above the text baseline (low/natural), UNIFORMLY regardless of the
-        // formula's height. Deep descenders below this are trimmed.
+        // Image bottom = math baseline + a small fixed descent, so simple formulas'
+        // main glyphs sit just above the text baseline (low/natural). But NEVER clip:
+        // a formula with real ink below that (a fraction's denominator, a deep
+        // subscript) extends the box to its ink bottom instead of being cut — it then
+        // rides a little higher, which the increased line-height absorbs.
         let d = (INLINE_DESCENT * RENDER_PT) as usize;
         (baseline.round().max(0.0) as usize)
             .saturating_add(d)
-            .max(y0 + 1)
+            .max(maxy + mt)
             .min(y0 + 4000)
     } else {
         (maxy + mt).min(h - 1)

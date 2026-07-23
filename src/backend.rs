@@ -393,7 +393,7 @@ fn wrap_card(css: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
          html,body{{background:#fff;color:#000;margin:0;padding:0;}}\
-         body.card{{font-size:40px;line-height:1.75;}}\
+         body.card{{font-size:40px;line-height:2.0;}}\
          .am-pad{{box-sizing:border-box;padding:64px 88px;max-width:1500px;\
          margin:0 auto;}}\
          .am-pad img{{max-width:100%;height:auto;}}\
@@ -402,8 +402,8 @@ fn wrap_card(css: &str, body: &str) -> String {
          /* am-overrides — win over the notetype CSS */\
          :root{{--font-size-regular:30px!important;--font-size-small:24px!important;\
          --card-max-width:60em!important;--img-width:66%!important;}}\
-         body.card{{font-size:36px!important;line-height:1.75!important;}}\
-         .am-pad,#qa{{line-height:1.75!important;}}\
+         body.card{{font-size:36px!important;line-height:2.0!important;}}\
+         .am-pad,#qa{{line-height:2.0!important;}}\
          .prettify-flashcard{{max-width:none!important;}}\
          .am-pad{{max-width:1520px!important;}}\
          #note-content,#example-content{{display:block!important;}}\
