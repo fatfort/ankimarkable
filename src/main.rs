@@ -119,6 +119,13 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
     // words while handwriting a sentence don't each trigger a refresh (they collapse
     // into one settle once you actually stop).
     const SETTLE_IDLE: Duration = Duration::from_millis(1200);
+    // Timestamp of the last touch event we processed. This panel drops RELEASE
+    // (and pen-up) samples; a dropped gesture-end would otherwise latch
+    // `multi_active()`/`is_inking()` true forever and silently swallow every later
+    // tap (the "frozen app" failure mode). If the screen has been untouched for
+    // STALE_IDLE while such a state is latched, we force it closed below.
+    let mut last_touch: Option<Instant> = None;
+    const STALE_IDLE: Duration = Duration::from_millis(2000);
 
     // Review state, populated when a deck is picked.
     let mut counts = Counts::default();
@@ -142,6 +149,20 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
     );
 
     'main: while RUNNING.load(Ordering::SeqCst) {
+        // Recover from a dropped terminal touch/pen event. This panel routinely
+        // drops the RELEASE that ends a two-finger gesture and the pen-up that ends
+        // a stroke; either leak latches `multi_active()`/`is_inking()` true, after
+        // which EVERY tap is swallowed (as a phantom gesture / as palm) and the app
+        // reads as frozen. There's no in-band signal that a held finger lifted, so
+        // we time it out: if the screen has been untouched for STALE_IDLE while such
+        // a state is latched, force the gesture tracker and any open stroke closed.
+        // (A real gesture completes well under STALE_IDLE, so this never clips one.)
+        if touch.multi_active() && last_touch.map_or(true, |t| t.elapsed() >= STALE_IDLE) {
+            touch = CardTouch::new();
+        }
+        if wb.is_inking() && last_pen.map_or(true, |t| t.elapsed() >= STALE_IDLE) {
+            wb.end_stroke();
+        }
         // Flush any pending ink FIRST (non-blocking; keeps the dirty region if the
         // e-ink server is still busy). Retrying at the loop top means a deferred
         // update lands promptly without ever blocking the loop. Once writing has
@@ -158,7 +179,16 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
             let gesture_quiet =
                 last_gesture.map_or(true, |t| t.elapsed() >= Duration::from_millis(500));
             if wb.needs_settle() && pen_quiet && gesture_quiet && !touch.multi_active() {
-                wb.settle_color(&mut qtfb);
+                // The settle is a GC16 pass whose ONLY job is to restore colour and
+                // wipe fast-waveform artifacts on the colour panel. In black-and-white
+                // mode there's no colour to restore, so it would be a pointless flash
+                // after every writing pause — drop it (also clears needs_settle() so
+                // the loop returns to its idle poll cadence).
+                if mono {
+                    wb.discard_settle();
+                } else {
+                    wb.settle_color(&mut qtfb);
+                }
             }
         }
         let reviewing = screen == Screen::Review;
@@ -234,6 +264,8 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
             if !is_touch {
                 continue 'input;
             }
+            // Stamp touch activity (feeds the stale-gesture recovery at the loop top).
+            last_touch = Some(Instant::now());
             // Palm rejection: ignore finger/palm touches within PALM_WINDOW of the
             // last pen activity, and while a stroke is actually in progress.
             if reviewing

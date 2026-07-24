@@ -126,6 +126,26 @@ impl Whiteboard {
         self.eraser = !self.eraser;
     }
 
+    /// Force-close any in-progress stroke without needing a pen-up sample. Recovery
+    /// path for a dropped BTN_TOUCH release: an `active` stroke that never ends keeps
+    /// `is_inking()` true, which latches palm-rejection on and swallows every finger
+    /// tap. Identical bookkeeping to the `s.up` branch of `ink_sample`.
+    pub fn end_stroke(&mut self) {
+        if let Some(st) = self.active.take() {
+            if !st.pts.is_empty() {
+                self.strokes.push(st);
+            }
+        }
+        self.last = None;
+    }
+
+    /// Drop a pending colour settle WITHOUT refreshing. In black-and-white mode there
+    /// is no colour to restore, so the fast-waveform ink stands as-is; this just
+    /// clears `needs_settle()` so the loop stops queuing a redundant GC16 flash.
+    pub fn discard_settle(&mut self) {
+        self.settle = None;
+    }
+
     /// Push `base` composited with `ink` into the framebuffer and do a clean full
     /// (GC16) refresh — used after any non-inking screen change.
     pub fn blit_full(&mut self, qtfb: &mut Qtfb) {
