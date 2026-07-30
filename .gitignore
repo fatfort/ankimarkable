@@ -1,2 +1,4 @@
 /.env
+# Rust build output (~2 GB: aarch64-musl release artifacts + vendored rslib).
+/target/
 /vendor/**/target/
