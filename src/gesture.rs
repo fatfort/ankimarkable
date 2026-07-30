@@ -112,6 +112,17 @@ impl CardTouch {
         self.contacts.contains_key(&dev_id)
     }
 
+    /// Drop a contact whose events the caller is deliberately ignoring (palm
+    /// rejection). Without this, a swallowed RELEASE leaves the contact in the map
+    /// forever: `multi_active()` stays latched and every later touch is eaten as a
+    /// phantom gesture — the exact wedge the STALE_IDLE recovery has to clean up.
+    pub fn forget(&mut self, dev_id: i32) {
+        self.contacts.remove(&dev_id);
+        if self.contacts.is_empty() {
+            self.reset_gesture();
+        }
+    }
+
     fn card_down(&self) -> usize {
         self.contacts.values().filter(|c| c.card).count()
     }

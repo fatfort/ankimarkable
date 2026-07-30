@@ -115,6 +115,12 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
     // Palm rejection: touches within this window of the last pen sample are ignored.
     let mut last_pen: Option<Instant> = None;
     const PALM_WINDOW: Duration = Duration::from_millis(250);
+    // …and while the pen merely HOVERS, which is the state your hand lands in when
+    // you settle it on the panel to start writing. Bounded by pen recency so a
+    // missing "left proximity" report can't lock out finger input permanently
+    // (hovering emits a steady event stream, so a real hover keeps refreshing it).
+    let mut pen_hover = false;
+    const HOVER_WINDOW: Duration = Duration::from_millis(1500);
     // Idle gap after which a colour settle fires — long enough that pauses BETWEEN
     // words while handwriting a sentence don't each trigger a refresh (they collapse
     // into one settle once you actually stop).
@@ -226,19 +232,37 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
         // top, coalesced and non-blocking — never per-sample, never blocking).
         if fds.len() == 2 && fds[1].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
             let mut inked = false;
+            let mut stroke_started = false;
+            // The PEN WINS over touch. Gating ink on `!touch.multi_active()` meant a
+            // resting palm — which reports as ≥2 card contacts — silently swallowed
+            // every sample for as long as the hand stayed down, i.e. writing simply
+            // didn't work. A palm can't be told from fingers by position, but the
+            // marker is separate hardware: if it's reporting, the hand on the glass
+            // is a palm, so ink unconditionally and cancel the phantom gesture below.
             let r = pen.as_mut().unwrap().drain(|s| {
                 inked = true;
-                if reviewing && !touch.multi_active() {
+                if reviewing {
+                    stroke_started |= s.down;
                     wb.ink_sample(s, &mut qtfb);
                 }
             });
-            if inked {
+            let p = pen.as_mut().unwrap();
+            pen_hover = p.in_proximity();
+            let pen_events = p.take_activity();
+            if stroke_started {
+                // Drop whatever the palm registered before the tip landed, so it can
+                // neither latch `multi_active()` nor fire a scroll/pinch mid-stroke.
+                touch = CardTouch::new();
+            }
+            // Stamp on ANY marker traffic, hover included — the palm-rejection window
+            // must already be open when the hand lands ahead of the first ink sample.
+            if inked || pen_events {
                 last_pen = Some(Instant::now());
+            }
+            if inked && reviewing {
                 // Ship the freshly-inked pixels NOW (same iteration) rather than
                 // waiting for the next poll cycle — one less cycle of ink latency.
-                if reviewing {
-                    wb.flush_ink(&mut qtfb);
-                }
+                wb.flush_ink(&mut qtfb);
             }
             if r.is_err() {
                 eprintln!("ankimarkable: pen read error — dropping pen");
@@ -264,15 +288,23 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
             if !is_touch {
                 continue 'input;
             }
-            // Stamp touch activity (feeds the stale-gesture recovery at the loop top).
-            last_touch = Some(Instant::now());
-            // Palm rejection: ignore finger/palm touches within PALM_WINDOW of the
-            // last pen activity, and while a stroke is actually in progress.
-            if reviewing
-                && (last_pen.map_or(false, |t| t.elapsed() < PALM_WINDOW) || wb.is_inking())
-            {
+            // Palm rejection: ignore finger/palm touches while a stroke is in
+            // progress, within PALM_WINDOW of the last pen sample, and while the pen
+            // hovers (the hand settles on the panel BEFORE the tip lands, so without
+            // the hover arm the palm gets a head start and registers as a gesture).
+            let pen_recent = last_pen.map_or(false, |t| t.elapsed() < PALM_WINDOW);
+            let hovering = pen_hover && last_pen.map_or(false, |t| t.elapsed() < HOVER_WINDOW);
+            if reviewing && (pen_recent || hovering || wb.is_inking()) {
+                // A swallowed RELEASE must still retire its contact — otherwise the
+                // palm stays "down" in the tracker and latches multi_active() on.
+                if ty == INPUT_TOUCH_RELEASE {
+                    touch.forget(ev.dev_id);
+                }
                 continue 'input;
             }
+            // Stamp only touches we actually act on: the stale-gesture recovery at the
+            // loop top must be able to fire while a rejected palm keeps streaming.
+            last_touch = Some(Instant::now());
 
             // ── Review-screen gesture routing (menu-open taps skip to hit_menu) ──
             if reviewing && !menu_open {

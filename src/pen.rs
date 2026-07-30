@@ -85,6 +85,8 @@ pub struct Pen {
     contact: bool,     // currently touching
     was_contact: bool, // contact at last emitted sample
     rubber: bool,      // eraser end (BTN_TOOL_RUBBER) in proximity
+    prox: bool,        // either end reported in proximity (hovering)
+    activity: bool,    // any marker traffic since the last take_activity()
     pub dev_path: String,
 }
 
@@ -113,12 +115,33 @@ impl Pen {
             contact: false,
             was_contact: false,
             rubber: false,
+            prox: false,
+            activity: false,
             dev_path,
         })
     }
 
     pub fn fd(&self) -> RawFd {
         self.fd
+    }
+
+    /// True while either pen end is in proximity of the glass (hovering), i.e.
+    /// `BTN_TOOL_PEN`/`BTN_TOOL_RUBBER` are asserted but the tip may not be down
+    /// yet. This is the signal that makes palm rejection work *before* the first
+    /// ink sample: the hand lands on the panel while the pen is still approaching,
+    /// so a hover means any concurrent finger contact is a palm.
+    ///
+    /// Callers must pair this with a recency check on `take_activity()` — if the
+    /// pen leaves without a closing `BTN_TOOL_*` report, proximity would otherwise
+    /// stay latched and lock out every finger touch.
+    pub fn in_proximity(&self) -> bool {
+        self.prox
+    }
+
+    /// Whether any marker event at all (including a bare hover move, which emits no
+    /// `PenSample`) arrived since the last call. Clears the flag.
+    pub fn take_activity(&mut self) -> bool {
+        std::mem::take(&mut self.activity)
     }
 
     fn map_x(&self, raw: i32) -> i32 {
@@ -166,6 +189,7 @@ impl Pen {
             for i in 0..count {
                 let ev: &InputEvent =
                     unsafe { &*(buf.as_ptr().add(i * sz) as *const InputEvent) };
+                self.activity = true;
                 match ev.type_ {
                     EV_ABS => match ev.code {
                         ABS_X => self.x = ev.value,
@@ -176,8 +200,12 @@ impl Pen {
                     EV_KEY => match ev.code {
                         BTN_TOUCH => self.contact = ev.value != 0,
                         // Flipped pen: the eraser end. Track which end is in proximity.
-                        BTN_TOOL_RUBBER => self.rubber = ev.value != 0,
+                        BTN_TOOL_RUBBER => {
+                            self.rubber = ev.value != 0;
+                            self.prox = ev.value != 0;
+                        }
                         BTN_TOOL_PEN => {
+                            self.prox = ev.value != 0;
                             if ev.value != 0 {
                                 self.rubber = false;
                             } else {
