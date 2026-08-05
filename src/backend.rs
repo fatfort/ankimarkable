@@ -408,6 +408,18 @@ fn wrap_card(css: &str, body: &str) -> String {
          .am-pad{{max-width:1520px!important;}}\
          #note-content,#example-content{{display:block!important;}}\
          #note-button,#example-button{{display:none!important;}}\
+         /* Math images are TEXT, not pictures: a notetype's `img{{…}}` rules \
+            (anki-prettify: display:block; margin:1em auto; max-width:50%) would \
+            otherwise drop every inline \\(x\\) onto its own centred line, and cap \
+            display math at half width. Desktop Anki never sees this because \
+            MathJax isn't an <img>. */\
+         img.am-math{{display:inline!important;margin:0 0.12em!important;\
+         max-width:100%!important;border-radius:0!important;opacity:1!important;\
+         filter:none!important;}}\
+         img.am-math+br{{display:inline!important;}}\
+         img.am-math-block{{display:block!important;margin:26px auto!important;\
+         max-width:100%!important;border-radius:0!important;opacity:1!important;\
+         filter:none!important;}}\
          </style></head>\
          <body class=\"card\"><div class=\"am-pad\"><div id=\"qa\">{body}</div></div></body></html>"
     )

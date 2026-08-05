@@ -257,6 +257,13 @@ fn alias_macros(tex: &str) -> String {
 /// Build the `<img>` tag for a rendered formula. The PNG is ink-tight and pure
 /// black; blitz/parley pins an inline image's bottom to the baseline, so no
 /// vertical-align is needed (and it would be ignored anyway).
+///
+/// The `am-math` / `am-math-block` classes are what `wrap_card`'s override sheet
+/// hooks: a notetype's own `img{…}` rules (anki-prettify sets `display:block;
+/// margin:1em auto`) would otherwise turn every inline `\(x\)` into its own
+/// centred line — a plain inline `style=` can't stop that, since it says nothing
+/// about `display`. Desktop Anki is immune because MathJax emits markup, not an
+/// `<img>`; we have to opt back out explicitly.
 fn img_tag(r: &Rendered, inline: bool) -> String {
     let w = r.w * DISPLAY_SCALE;
     let h = r.h * DISPLAY_SCALE;
@@ -271,7 +278,7 @@ fn img_tag(r: &Rendered, inline: bool) -> String {
         // max-width keeps a very wide equation from overflowing (height:auto
         // preserves aspect if it has to shrink).
         format!(
-            "<img class=\"am-math\" style=\"display:block;margin:26px auto;\
+            "<img class=\"am-math-block\" style=\"display:block;margin:26px auto;\
              width:{w:.1}px;max-width:100%;height:auto;\" src=\"{uri}\">",
             uri = r.uri
         )
